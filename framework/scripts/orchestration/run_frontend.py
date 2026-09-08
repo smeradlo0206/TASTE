@@ -887,12 +887,60 @@ supervisor = FeedbackSupervisor(
     initial_state=initial_supervisor_state,
 )
 feedback_decisions = []
+feedback_monitor_started_logged = False
+feedback_summary_logged = False
+
+def _report_feedback_trace_failure():
+    try:
+        print("[framework] Feedback trace emission failed", flush=True)
+    except Exception:
+        pass
+
+def _emit_feedback_monitor_started_once():
+    global feedback_monitor_started_logged
+    if feedback_monitor_started_logged:
+        return
+    feedback_monitor_started_logged = True
+    try:
+        payload = {{"event": "monitor_started"}}
+        print(
+            "TASTE_FEEDBACK_TRACE "
+            + json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
+    except Exception:
+        _report_feedback_trace_failure()
+
+def _emit_feedback_summary_once():
+    global feedback_summary_logged
+    if feedback_summary_logged:
+        return
+    feedback_summary_logged = True
+    try:
+        summary = supervisor.trace_summary
+        payload = {{
+            "event": "summary",
+            "monitor_calls": summary["monitor_calls"],
+            "observer_status": summary["observer_status"],
+            "validation_status": summary["validation_status"],
+            "anomaly_kind": summary["anomaly_kind"],
+            "controller_called": summary["controller_called"],
+            "recovery_decision_action": summary["recovery_decision_action"],
+        }}
+        print(
+            "TASTE_FEEDBACK_TRACE "
+            + json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
+    except Exception:
+        _report_feedback_trace_failure()
 
 def _on_feedback_monitor_tick(handle):
     decision = supervisor.on_monitor_tick(
         run_context=run_context,
         execution_handle=handle,
     )
+    _emit_feedback_monitor_started_once()
     if decision is not None:
         feedback_decisions.append(decision)
 
@@ -940,10 +988,12 @@ def _notify_feedback_process_exited():
 if execution_handle.run_id and execution_handle.run_dir:
     _notify_feedback_process_exited()
     terminal_feedback_called = True
+    _emit_feedback_summary_once()
 
 if returncode != 0:
     if not terminal_feedback_called:
         print("[framework] Find exited before run identity was bound", flush=True)
+        _emit_feedback_summary_once()
     raise SystemExit(returncode)
 
 run_id, directory, result = _parse_find_cli_result(stdout_output, finding_module)
@@ -960,6 +1010,7 @@ else:
 if not terminal_feedback_called:
     _notify_feedback_process_exited()
     terminal_feedback_called = True
+    _emit_feedback_summary_once()
 out_dir = internal_output_dir if internal_output_dir is not None else paths.planning / "finding"
 out_dir.mkdir(parents=True, exist_ok=True)
 

@@ -1718,6 +1718,15 @@ def test_run_frontend_feedback_wiring_preserves_find_launch_contract(tmp_path):
     assert "proc = subprocess.Popen(find_cmd" not in source
 
 
+def _feedback_trace_payloads(stdout: str) -> list[dict[str, object]]:
+    prefix = "TASTE_FEEDBACK_TRACE "
+    return [
+        json.loads(line[len(prefix) :])
+        for line in stdout.splitlines()
+        if line.startswith(prefix)
+    ]
+
+
 def test_generated_driver_wires_supervisor_between_context_and_executor(tmp_path):
     from orchestration import run_frontend
 
@@ -1760,6 +1769,9 @@ def test_generated_driver_wires_supervisor_between_context_and_executor(tmp_path
     assert "on_monitor_tick=_on_feedback_monitor_tick" in source
     assert "feedback_decisions.append(decision)" in source
     assert "decision.action" not in source
+    assert 'TASTE_FEEDBACK_TRACE ' in source
+    assert '"event": "monitor_started"' in source
+    assert '"event": "summary"' in source
 
 
 @pytest.mark.skipif(os.name != "posix", reason="the isolated generated driver uses POSIX symlinks")
@@ -2106,6 +2118,40 @@ def capture_completed_handles():
     result = json.loads(result_path.read_text(encoding="utf-8"))
 
     assert completed.returncode == 0
+    trace_payloads = _feedback_trace_payloads(completed.stdout)
+    assert [payload["event"] for payload in trace_payloads] == [
+        "monitor_started",
+        "summary",
+    ]
+    assert trace_payloads[0] == {"event": "monitor_started"}
+    assert trace_payloads[1] == {
+        "event": "summary",
+        "monitor_calls": len(monitor_events),
+        "observer_status": observer_events[-1]["snapshot"]["status"],
+        "validation_status": "pass",
+        "anomaly_kind": None,
+        "controller_called": False,
+        "recovery_decision_action": None,
+    }
+    trace_lines = [
+        line
+        for line in completed.stdout.splitlines()
+        if line.startswith("TASTE_FEEDBACK_TRACE ")
+    ]
+    assert not any(
+        sensitive in line
+        for line in trace_lines
+        for sensitive in (
+            "context_id",
+            "run_id",
+            "run_dir",
+            "stdout_path",
+            "stderr_path",
+            "decision_id",
+            "anomaly_id",
+            "api_key",
+        )
+    )
     assert [ref["case_id"] for ref in captured_context["matched_experience_refs"]] == [synthetic_case.case_id]
     assert [ref["case_id"] for ref in captured_context["applied_experience_refs"]] == [synthetic_case.case_id]
     assert captured_context["requested_parameters"]["abstract_scoring_max_workers"] == 2
@@ -2277,19 +2323,22 @@ if mode == "bound_nonzero":
     ),
     encoding="utf-8",
 )
-conflict_id = "find-conflicting-final"
-conflict_dir = runs_dir / conflict_id
-conflict_dir.mkdir()
-(conflict_dir / "find_results.json").write_text(
-    json.dumps(
-        {{
-            "run_id": conflict_id,
-            "strong_recommendations": [{{"id": "paper-conflict", "title": "Conflict result"}}],
-        }}
-    ),
-    encoding="utf-8",
-)
-print(json.dumps({{"run_id": conflict_id, "run_dir": str(conflict_dir)}}), flush=True)
+if mode == "trace_summary_failure":
+    print(json.dumps({{"run_id": run_id, "run_dir": str(run_dir)}}), flush=True)
+else:
+    conflict_id = "find-conflicting-final"
+    conflict_dir = runs_dir / conflict_id
+    conflict_dir.mkdir()
+    (conflict_dir / "find_results.json").write_text(
+        json.dumps(
+            {{
+                "run_id": conflict_id,
+                "strong_recommendations": [{{"id": "paper-conflict", "title": "Conflict result"}}],
+            }}
+        ),
+        encoding="utf-8",
+    )
+    print(json.dumps({{"run_id": conflict_id, "run_dir": str(conflict_dir)}}), flush=True)
 ''',
         encoding="utf-8",
     )
@@ -2333,6 +2382,10 @@ def capture_start(run_context):
 run_frontend._start_find_with_executor = capture_start
 
 from feedback import FeedbackSupervisor, FindRecoveryController
+if os.environ.get("FAIL_FEEDBACK_TRACE_SUMMARY") == "1":
+    def fail_trace_summary(_self):
+        raise RuntimeError("synthetic trace summary failure")
+    FeedbackSupervisor.trace_summary = property(fail_trace_summary)
 original_exited = FeedbackSupervisor.on_process_exited
 def capture_exited(self, **kwargs):
     decision = original_exited(self, **kwargs)
@@ -2393,6 +2446,7 @@ def capture_handles():
             "TASTE_FIND_INPUT_DIR": str(tmp_path / "driver-input"),
             "TASTE_INTERNAL_FIND_OUTPUT_DIR": str(tmp_path / "driver-output"),
             "LIFECYCLE_CAPTURE_PATH": str(capture_path),
+            "FAIL_FEEDBACK_TRACE_SUMMARY": "1" if mode == "trace_summary_failure" else "0",
             "PYTHONPATH": os.pathsep.join(
                 [str(instrumentation_dir), str(ROOT / "framework" / "scripts")]
             ),
@@ -2444,21 +2498,58 @@ def test_generated_driver_terminal_lifecycle_preserves_identity_and_exit_code(
     assert len(terminal_events) == expected_terminal_calls
     assert len(controller_events) <= 1
     assert not any(event["event"] in {"adopt", "read_default"} for event in events)
+    trace_payloads = _feedback_trace_payloads(completed.stdout)
+    summary_payloads = [
+        payload for payload in trace_payloads if payload["event"] == "summary"
+    ]
+    assert len(summary_payloads) == 1
 
     if mode == "bound_nonzero":
         assert handles[0]["run_id"] == "find-bound-terminal"
         assert terminal_events[0]["handle"]["exit_code"] == 7
         assert terminal_events[0]["decision"] is not None
         assert len(controller_events) == 1
+        assert summary_payloads[0]["validation_status"] == "block"
+        assert summary_payloads[0]["anomaly_kind"] == "process_exited_nonzero"
+        assert summary_payloads[0]["controller_called"] is True
+        assert summary_payloads[0]["recovery_decision_action"] == "stop_and_report"
     elif mode == "unbound_nonzero":
         assert handles[0]["run_id"] is None
         assert handles[0]["run_dir"] is None
         assert controller_events == []
         assert "Find exited before run identity was bound" in completed.stdout
+        assert summary_payloads[0]["validation_status"] is None
+        assert summary_payloads[0]["anomaly_kind"] is None
+        assert summary_payloads[0]["controller_called"] is False
+        assert summary_payloads[0]["recovery_decision_action"] is None
     else:
         assert handles[0]["run_id"] == "find-bound-terminal"
         assert "run identity conflicts with the bound Find run" in completed.stdout
         assert controller_events == []
+        assert summary_payloads[0]["validation_status"] == "pass"
+        assert summary_payloads[0]["anomaly_kind"] is None
+        assert summary_payloads[0]["controller_called"] is False
+        assert summary_payloads[0]["recovery_decision_action"] is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="generated driver lifecycle uses POSIX symlinks")
+def test_generated_driver_trace_failure_does_not_change_success_path(tmp_path, monkeypatch):
+    completed, events = _run_generated_driver_terminal_case(
+        tmp_path,
+        monkeypatch,
+        "trace_summary_failure",
+    )
+
+    handles = [event["handle"] for event in events if event["event"] == "completed_handle"]
+    assert completed.returncode == 0
+    assert len([event for event in events if event["event"] == "popen"]) == 1
+    assert len(handles) == 1
+    assert handles[0]["process_alive"] is False
+    assert handles[0]["exit_code"] == 0
+    assert "[framework] Feedback trace emission failed" in completed.stdout
+    assert [
+        payload["event"] for payload in _feedback_trace_payloads(completed.stdout)
+    ] == ["monitor_started"]
 
 
 def _make_local_find_run_context(tmp_path: Path, script: str):

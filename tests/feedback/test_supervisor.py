@@ -406,6 +406,7 @@ def test_monitor_tick_rejects_invalid_input_types(
             execution_handle=handle,  # type: ignore[arg-type]
             cancel_requested=cancel_requested,  # type: ignore[arg-type]
         )
+    assert supervisor.trace_summary["monitor_calls"] == 0
 
 
 def test_monitor_tick_rejects_context_mismatch() -> None:
@@ -636,3 +637,128 @@ def test_supervisor_does_not_mutate_inputs_or_expose_mutable_internal_state() ->
 
     assert tuple(value.to_dict() for value in (context, handle, state, snapshot, anomaly)) == originals
     assert supervisor.state.gate_reason == "Preparing Find supervision"
+
+
+def test_trace_summary_starts_empty_and_counts_successful_monitor_calls() -> None:
+    first = _snapshot(sequence=0)
+    second = _snapshot(sequence=1, status=ProgressStatus.RUNNING)
+    supervisor, *_ = _supervisor(
+        snapshots=[first, second],
+        anomalies=[None, None],
+    )
+
+    assert supervisor.trace_summary == {
+        "monitor_calls": 0,
+        "observer_status": None,
+        "validation_status": None,
+        "anomaly_kind": None,
+        "controller_called": False,
+        "recovery_decision_action": None,
+    }
+
+    supervisor.on_monitor_tick(
+        run_context=_run_context(),
+        execution_handle=_handle(),
+    )
+    assert supervisor.trace_summary["monitor_calls"] == 1
+    assert supervisor.trace_summary["observer_status"] == "starting"
+
+    supervisor.on_monitor_tick(
+        run_context=_run_context(),
+        execution_handle=_handle(),
+    )
+    assert supervisor.trace_summary["monitor_calls"] == 2
+    assert supervisor.trace_summary["observer_status"] == "running"
+
+
+def test_trace_summary_records_normal_terminal_validation_without_controller() -> None:
+    supervisor, *_ = _supervisor(
+        snapshots=[],
+        validation=_validation(),
+        anomalies=[None],
+    )
+
+    assert supervisor.on_process_exited(
+        run_context=_run_context(),
+        execution_handle=_handle(bound=True, alive=False),
+    ) is None
+    assert supervisor.trace_summary == {
+        "monitor_calls": 0,
+        "observer_status": None,
+        "validation_status": "pass",
+        "anomaly_kind": None,
+        "controller_called": False,
+        "recovery_decision_action": None,
+    }
+
+
+def test_trace_summary_records_anomaly_and_recovery_decision() -> None:
+    anomaly = _anomaly()
+    decision = _decision(anomaly)
+    supervisor, *_ = _supervisor(
+        snapshots=[],
+        validation=_validation(status=ValidationStatus.BLOCK),
+        anomalies=[anomaly],
+        decisions=[decision],
+    )
+
+    assert supervisor.on_process_exited(
+        run_context=_run_context(),
+        execution_handle=_handle(bound=True, alive=False),
+    ) == decision
+    assert supervisor.trace_summary == {
+        "monitor_calls": 0,
+        "observer_status": None,
+        "validation_status": "block",
+        "anomaly_kind": anomaly.kind,
+        "controller_called": True,
+        "recovery_decision_action": "stop_and_report",
+    }
+
+
+def test_trace_summary_counts_controller_call_that_raises() -> None:
+    anomaly = _anomaly()
+    supervisor, *_ = _supervisor(
+        snapshots=[],
+        validation=_validation(status=ValidationStatus.BLOCK),
+        anomalies=[anomaly],
+        decisions=[RuntimeError("private controller detail")],
+    )
+
+    with pytest.raises(RuntimeError, match="recovery controller"):
+        supervisor.on_process_exited(
+            run_context=_run_context(),
+            execution_handle=_handle(bound=True, alive=False),
+        )
+
+    assert supervisor.trace_summary["controller_called"] is True
+    assert supervisor.trace_summary["recovery_decision_action"] is None
+    assert supervisor.trace_summary["anomaly_kind"] == anomaly.kind
+
+
+def test_trace_summary_does_not_count_duplicate_terminal_anomaly_twice() -> None:
+    anomaly = _anomaly()
+    decision = _decision(anomaly)
+    supervisor, *_ = _supervisor(
+        validation=_validation(status=ValidationStatus.BLOCK),
+        anomalies=[anomaly, anomaly],
+        decisions=[decision],
+    )
+    context = _run_context()
+    handle = _handle(bound=True, alive=False)
+
+    assert supervisor.on_process_exited(run_context=context, execution_handle=handle) == decision
+    assert supervisor.on_process_exited(run_context=context, execution_handle=handle) is None
+    assert supervisor.trace_summary["controller_called"] is True
+    assert supervisor._controller_call_count == 1
+
+
+def test_trace_summary_returns_a_fresh_detached_mapping() -> None:
+    supervisor, *_ = _supervisor()
+
+    first = supervisor.trace_summary
+    first["monitor_calls"] = 99
+    first["observer_status"] = "caller-mutation"
+
+    assert supervisor.trace_summary["monitor_calls"] == 0
+    assert supervisor.trace_summary["observer_status"] is None

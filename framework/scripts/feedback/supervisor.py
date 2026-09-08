@@ -48,11 +48,38 @@ class FeedbackSupervisor:
         self._last_anomaly: Anomaly | None = None
         self._last_decision: RecoveryDecision | None = None
         self._handled_anomalies: set[str] = set()
+        self._monitor_call_count = 0
+        self._controller_call_count = 0
 
     @property
     def state(self) -> SupervisorState:
         """Return a detached view of the current in-memory state."""
         return deepcopy(self._state)
+
+    trace_summary = property(
+        lambda self: {
+            "monitor_calls": self._monitor_call_count,
+            "observer_status": (
+                None
+                if self._previous_snapshot is None
+                else self._previous_snapshot.status.value
+            ),
+            "validation_status": (
+                None
+                if self._last_validation_result is None
+                else self._last_validation_result.status.value
+            ),
+            "anomaly_kind": (
+                None if self._last_anomaly is None else self._last_anomaly.kind
+            ),
+            "controller_called": self._controller_call_count > 0,
+            "recovery_decision_action": (
+                None
+                if self._last_decision is None
+                else self._last_decision.action.value
+            ),
+        }
+    )
 
     def on_monitor_tick(
         self,
@@ -65,6 +92,7 @@ class FeedbackSupervisor:
         self._validate_common_inputs(run_context, execution_handle)
         if type(cancel_requested) is not bool:
             raise TypeError("cancel_requested must be a bool")
+        self._monitor_call_count += 1
 
         try:
             snapshot = self._observer.observe(
@@ -158,6 +186,7 @@ class FeedbackSupervisor:
             updated_at=_utc_now(),
             active_anomaly_id=anomaly.anomaly_id,
         )
+        self._controller_call_count += 1
         try:
             decision = self._recovery_controller.decide(
                 anomaly=deepcopy(anomaly),
