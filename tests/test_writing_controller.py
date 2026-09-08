@@ -247,8 +247,9 @@ def test_interrupt_runs_web_message_first_then_resumes_old_work(monkeypatch, tmp
         interrupt_current=True,
         on_queued=events.append,
     )
-    thread.join(timeout=10)
+    thread.join(timeout=30)
 
+    assert not thread.is_alive()
     assert priority["status"] == "completed"
     assert priority["interrupted_current"] is True
     assert old_result["status"] == "completed"

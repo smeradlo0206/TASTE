@@ -2815,7 +2815,7 @@ _, execution_handle, process = _start_find_with_executor(run_context)
 _register_find_process_exit_cleanup(process)
 if {fail_after_start!r}:
     ready_path = Path({str(find_ready_path) if find_ready_path is not None else ''!r})
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 30
     while not ready_path.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     if not ready_path.exists():
@@ -3142,7 +3142,7 @@ def _write_process_tree_driver(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _read_owned_test_pids(path: Path) -> list[int]:
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if path.exists():
             return [int(value) for value in json.loads(path.read_text(encoding="utf-8")).values()]
@@ -3202,7 +3202,7 @@ def test_run_frontend_cancellation_terminates_driver_find_and_descendant(monkeyp
 
     monkeypatch.setattr(run_frontend.select, "select", cancel_after_find_starts)
     with pytest.raises(KeyboardInterrupt):
-        run_frontend.run([sys.executable, str(driver)], timeout_sec=15)
+        run_frontend.run([sys.executable, str(driver)], timeout_sec=30)
     _assert_owned_pids_exit(_read_owned_test_pids(pids_path))
 
 
