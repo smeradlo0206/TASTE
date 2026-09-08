@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -24,6 +28,30 @@ from project import project_config
 from reporting import paper_state
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_reading_latest_run_refresh_failure_keeps_canonical_run_result(monkeypatch, tmp_path):
+    module_path = ROOT / "modules" / "reading" / "scripts" / "pipeline" / "read_pipeline.py"
+    spec = importlib.util.spec_from_file_location("test_read_pipeline_latest_run", module_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    canonical_run = tmp_path / "20260822T053007375606Z"
+    canonical_run.mkdir()
+
+    def fail_refresh(_: Path) -> Path:
+        raise OSError("DrvFS metadata copy is not permitted")
+
+    monkeypatch.setattr(module, "refresh_latest_run", fail_refresh)
+
+    latest_run, warning = module.refresh_latest_run_nonfatal(canonical_run)
+
+    assert latest_run is None
+    assert warning["status"] == "warning"
+    assert warning["error_type"] == "OSError"
+    assert "DrvFS metadata copy" in warning["message"]
 
 
 def _make_project(projects: Path, name: str = "demo") -> Path:
@@ -1049,8 +1077,13 @@ def test_web_find_action_uses_framework_run_frontend(monkeypatch, tmp_path):
         "project": "demo",
         "action": "find",
         "web_job_id": "find_test_web_action",
+        "request_source": "web",
         "max_papers": 7,
         "max_ideas": 3,
+        "force_new_find": True,
+        "restart_full_cycle": True,
+        "human_approved_new_find": True,
+        "approval_reason": "The user approved a fresh Find run.",
         "skip_arxiv": True,
         "deep_survey": True,
         "queries": ["protein design"],
@@ -1067,6 +1100,12 @@ def test_web_find_action_uses_framework_run_frontend(monkeypatch, tmp_path):
     assert "--max-papers" in cmd and cmd[cmd.index("--max-papers") + 1] == "7"
     assert "--max-ideas" in cmd and cmd[cmd.index("--max-ideas") + 1] == "3"
     assert "--web-job-id" in cmd and cmd[cmd.index("--web-job-id") + 1] == "find_test_web_action"
+    assert "--request-source" in cmd and cmd[cmd.index("--request-source") + 1] == "web"
+    assert "--force-new-find" in cmd
+    assert "--restart-full-cycle" in cmd
+    assert "--human-approved-new-find" in cmd
+    assert "--approval-reason" in cmd
+    assert cmd[cmd.index("--approval-reason") + 1] == "The user approved a fresh Find run."
     assert "--skip-arxiv" in cmd
     assert "--deep-survey" in cmd
     assert "--query" in cmd and cmd[cmd.index("--query") + 1] == "protein design"
@@ -1099,6 +1138,10 @@ def test_web_find_request_passes_project_selection_to_framework(monkeypatch, tmp
             venue_title_scan_limit=0,
         ),
         selection=selection,
+        force_new_find=True,
+        restart_full_cycle=True,
+        human_approved_new_find=True,
+        approval_reason="The user approved a fresh Find run.",
     )
     captured: dict[str, object] = {}
     persisted_config: dict[str, object] = {}
@@ -1144,6 +1187,11 @@ def test_web_find_request_passes_project_selection_to_framework(monkeypatch, tmp
     assert str(captured["web_job_id"]).startswith("find_")
     assert captured["selection"] == web_server.normalize_source_selection(selection)
     assert captured["queries"] == ["protein inverse folding"]
+    assert captured["request_source"] == "web"
+    assert captured["force_new_find"] is True
+    assert captured["restart_full_cycle"] is True
+    assert captured["human_approved_new_find"] is True
+    assert captured["approval_reason"] == "The user approved a fresh Find run."
     assert "deep_survey" not in captured
     assert persisted_config["nonvenue_fetch_limit"] == 2400
     assert persisted_config["title_abstract_scoring_limit"] == 1800
@@ -1463,6 +1511,1705 @@ def test_run_frontend_finding_input_snapshot_omits_api_key():
 
     assert '"api_key": "",' in text
     assert '"api_key": api_key' not in text
+
+
+def test_run_frontend_builds_find_stage_request_before_starting_find():
+    text = (ROOT / "framework" / "scripts" / "orchestration" / "run_frontend.py").read_text(encoding="utf-8")
+
+    builder_call = text.index("find_stage_request = build_find_stage_request(")
+    process_start = text.index("executor, execution_handle, process = _start_find_with_executor(run_context)")
+
+    assert builder_call < process_start
+    assert "research_topic=configured_topic" in text
+    assert "selection=selection_payload" in text
+    assert "config_path=str(find_config_path)" in text
+    assert "requested_parameters=find_config_payload" in text
+    assert "working_directory=str(root)" in text
+
+
+def test_run_frontend_generated_driver_carries_find_request_controls(tmp_path):
+    from orchestration import run_frontend
+
+    driver = tmp_path / "run_driver.py"
+    run_frontend.write_driver(
+        driver,
+        "demo",
+        7,
+        3,
+        1,
+        True,
+        False,
+        False,
+        True,
+        {"venue_ids": ["dblp_icml"], "include_arxiv": True},
+        request_source="web",
+        force_new_find=True,
+        restart_full_cycle=True,
+        human_approved_new_find=True,
+        approval_reason="The user approved a fresh Find run.",
+    )
+
+    source = driver.read_text(encoding="utf-8")
+    compile(source, str(driver), "exec")
+    assert 'request_source = "web"' in source
+    assert "force_new_find = True" in source
+    assert "restart_full_cycle = True" in source
+    assert "human_approved_new_find = True" in source
+    assert 'approval_reason = "The user approved a fresh Find run."' in source
+
+
+def test_run_frontend_generated_driver_queries_read_only_experience_store_before_find(tmp_path):
+    from orchestration import run_frontend
+
+    driver = tmp_path / "run_driver.py"
+    run_frontend.write_driver(
+        driver,
+        "demo",
+        7,
+        3,
+        1,
+        True,
+        False,
+        False,
+        True,
+        {"venue_ids": ["dblp_icml"], "include_arxiv": True},
+    )
+
+    source = driver.read_text(encoding="utf-8")
+    compile(source, str(driver), "exec")
+    request_index = source.index("find_stage_request = build_find_stage_request(")
+    query_index = source.index("experience_query = build_experience_query(")
+    store_index = source.index("experience_store = JsonExperienceStore(")
+    search_index = source.index("matched_experiences = experience_store.search_cases(")
+    process_index = source.index("executor, execution_handle, process = _start_find_with_executor(run_context)")
+
+    assert request_index < query_index < store_index < search_index < process_index
+    assert "build_experience_query" in source
+    assert "JsonExperienceStore" in source
+    assert 'root / ".runtime" / "feedback" / "experience_cases.json"' in source
+    assert "required_context_tags=[]" in source
+    assert "limit=5" in source
+    assert source.count("matched_experiences") == 2
+    launch_segment = source[process_index:source.index("stdout_output = _consume_execution_logs(")]
+    assert "matched_experiences" not in launch_segment
+
+
+def test_run_frontend_generated_driver_adapts_matched_find_experiences(tmp_path):
+    from orchestration import run_frontend
+
+    driver = tmp_path / "run_driver.py"
+    run_frontend.write_driver(
+        driver,
+        "demo",
+        7,
+        3,
+        1,
+        True,
+        False,
+        False,
+        True,
+        {"venue_ids": ["dblp_icml"], "include_arxiv": True},
+    )
+
+    source = driver.read_text(encoding="utf-8")
+    compile(source, str(driver), "exec")
+    search_index = source.index("matched_experiences = experience_store.search_cases(")
+    adapter_index = source.index("run_context = FindFeedbackAdapter().adapt(")
+    effective_index = source.index("dict(run_context.effective_parameters)")
+    runtime_write_index = source.index(
+        "write_json_file(find_config_path, runtime_find_config)"
+    )
+    process_index = source.index("executor, execution_handle, process = _start_find_with_executor(run_context)")
+
+    assert "from feedback import (" in source
+    assert "FindFeedbackAdapter," in source
+    assert search_index < adapter_index < effective_index < runtime_write_index < process_index
+
+
+def test_run_frontend_generated_driver_uses_effective_find_parameters(tmp_path):
+    from orchestration import run_frontend
+
+    driver = tmp_path / "run_driver.py"
+    run_frontend.write_driver(
+        driver,
+        "demo",
+        7,
+        3,
+        1,
+        True,
+        False,
+        False,
+        True,
+        {"venue_ids": ["dblp_icml"], "include_arxiv": True},
+    )
+
+    source = driver.read_text(encoding="utf-8")
+    compile(source, str(driver), "exec")
+    runtime_start = source.index("runtime_find_config = {")
+    runtime_write_index = source.index(
+        "write_json_file(find_config_path, runtime_find_config)"
+    )
+    runtime_payload = source[runtime_start:runtime_write_index]
+
+    assert '"config": dict(run_context.effective_parameters),' in runtime_payload
+    assert "find_config_payload" not in runtime_payload
+
+
+def test_run_frontend_generated_driver_does_not_rewrite_existing_project_find_config(tmp_path):
+    from orchestration import run_frontend
+
+    driver = tmp_path / "run_driver.py"
+    run_frontend.write_driver(
+        driver,
+        "demo",
+        7,
+        3,
+        1,
+        True,
+        False,
+        False,
+        True,
+        {"venue_ids": ["dblp_icml"], "include_arxiv": True},
+    )
+
+    source = driver.read_text(encoding="utf-8")
+    compile(source, str(driver), "exec")
+    assert "project_find_config_source = ensure_project_find_config()" in source
+    assert "project_find_config_payload = read_json_file(project_find_config_source)" in source
+    assert "write_json_file(project_find_config_path, combined_find_config)" not in source
+    assert '"config": dict(run_context.effective_parameters),' in source
+    assert "write_json_file(find_config_path, runtime_find_config)" in source
+    assert "if not project_find_config_path.exists():" in source
+    assert "write_json_file(project_find_config_path, payload)" in source
+
+
+def test_run_frontend_feedback_wiring_preserves_find_launch_contract(tmp_path):
+    from orchestration import run_frontend
+
+    driver = tmp_path / "run_driver.py"
+    run_frontend.write_driver(
+        driver,
+        "demo",
+        7,
+        3,
+        1,
+        True,
+        False,
+        False,
+        True,
+        {"venue_ids": ["dblp_icml"], "include_arxiv": True},
+    )
+
+    source = driver.read_text(encoding="utf-8")
+    compile(source, str(driver), "exec")
+    runtime_write_index = source.index(
+        "write_json_file(find_config_path, runtime_find_config)"
+    )
+    process_index = source.index("executor, execution_handle, process = _start_find_with_executor(run_context)")
+
+    assert runtime_write_index < process_index
+    assert "write_json_file(input_path, input_payload)" in source
+    assert "selection_path.write_text(json.dumps(selection_payload" in source
+    assert "_start_find_with_executor(run_context)" in source
+    assert "_register_find_process_exit_cleanup(process)" in source
+    assert "_consume_execution_logs(" in source
+    assert "_parse_find_cli_result(stdout_output, finding_module)" in source
+    assert "process.stdout" not in source
+    assert "proc = subprocess.Popen(find_cmd" not in source
+
+
+def test_generated_driver_wires_supervisor_between_context_and_executor(tmp_path):
+    from orchestration import run_frontend
+
+    driver = tmp_path / "run_driver.py"
+    run_frontend.write_driver(
+        driver,
+        "demo",
+        7,
+        3,
+        1,
+        True,
+        False,
+        False,
+        True,
+        {"venue_ids": ["dblp_icml"], "include_arxiv": True},
+    )
+
+    source = driver.read_text(encoding="utf-8")
+    compile(source, str(driver), "exec")
+    context_index = source.index("run_context = FindFeedbackAdapter().adapt(")
+    supervisor_index = source.index("supervisor = FeedbackSupervisor(")
+    executor_index = source.index(
+        "executor, execution_handle, process = _start_find_with_executor(run_context)"
+    )
+    terminal_index = source.index(
+        "    _notify_feedback_process_exited()\n    terminal_feedback_called = True"
+    )
+    exit_index = source.index("if returncode != 0:")
+    parse_index = source.index(
+        "run_id, directory, result = _parse_find_cli_result(stdout_output, finding_module)"
+    )
+    publish_index = source.index("adopt_taste_find_run(")
+
+    assert context_index < supervisor_index < executor_index
+    assert executor_index < terminal_index < exit_index < parse_index < publish_index
+    assert "experience_store=experience_store" in source
+    assert source.count("JsonExperienceStore(") == 1
+    assert "recovery_advisor=None" in source
+    assert "LLMRecoveryAdvisor" not in source
+    assert "on_monitor_tick=_on_feedback_monitor_tick" in source
+    assert "feedback_decisions.append(decision)" in source
+    assert "decision.action" not in source
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the isolated generated driver uses POSIX symlinks")
+def test_generated_driver_runs_isolated_feedback_executor_chain(tmp_path, monkeypatch):
+    from feedback import (
+        EvidenceRef,
+        ExperienceCase,
+        ParameterChange,
+        RiskLevel,
+        ValidationStatus,
+    )
+    from orchestration import run_frontend
+
+    isolated_root = tmp_path / "isolated-taste"
+    isolated_root.mkdir()
+    (isolated_root / "framework").symlink_to(ROOT / "framework", target_is_directory=True)
+    project_id = "offline-feedback-e2e"
+    project_root = isolated_root / "projects" / project_id
+    project_config_path = project_root / "project.json"
+    project_find_config_path = project_root / "config" / "finding.json"
+    project_find_config_path.parent.mkdir(parents=True)
+    project_config = {
+        "name": project_id,
+        "topic": "Offline generated driver feedback test",
+        "user_prompt": "No network is permitted.",
+        "queries": ["offline synthetic query"],
+    }
+    source_selection = {
+        "venue_ids": [],
+        "years": [2026],
+        "venue_years": [],
+        "include_arxiv": False,
+        "include_huggingface": False,
+        "include_github": False,
+        "include_biorxiv": False,
+        "include_nature": False,
+        "include_science": False,
+    }
+    requested_parameters = {
+        "abstract_scoring_max_workers": 2,
+        "abstract_scoring_batch_size": 1,
+        "abstract_scoring_timeout_sec": 15,
+        "arxiv_timeout_sec": 15,
+        "nonvenue_fetch_limit": 1,
+        "title_abstract_scoring_limit": 1,
+        "arxiv_max_queries": 1,
+        "runtime_tuning": {
+            "ABSTRACT_SCORING_MAX_WORKERS": "2",
+            "ABSTRACT_SCORING_WORKER_CAP": "2",
+        },
+    }
+    project_config_path.write_text(json.dumps(project_config), encoding="utf-8")
+    project_find_config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config": requested_parameters,
+                "selection": source_selection,
+            }
+        ),
+        encoding="utf-8",
+    )
+    project_config_before = project_config_path.read_bytes()
+    project_find_config_before = project_find_config_path.read_bytes()
+
+    store_path = isolated_root / ".runtime" / "feedback" / "experience_cases.json"
+    store_path.parent.mkdir(parents=True)
+    synthetic_case = ExperienceCase(
+        case_id="case-offline-generated-driver-worker-one",
+        case_type="normal",
+        created_at=datetime(2026, 9, 5, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 9, 5, tzinfo=timezone.utc),
+        producer="feedback-e2e-test",
+        producer_version="synthetic-test-only",
+        verified=True,
+        deprecated=False,
+        context_id="ctx-synthetic-test-only",
+        root_run_id="find-synthetic-root",
+        final_run_id="find-synthetic-final",
+        root_cause_status="unknown",
+        evidence_refs=[EvidenceRef(kind="test", summary="Synthetic test-only case")],
+        attempt_count=0,
+        outcome="success",
+        validation_after_id="validation-synthetic",
+        validation_after_status=ValidationStatus.PASS,
+        ready_for_read_after=True,
+        risk_level=RiskLevel.LOW,
+        confidence=1.0,
+        matched_count=0,
+        applied_count=0,
+        successful_application_count=0,
+        project_id=project_id,
+        context_tags=["synthetic", "test-only"],
+        parameter_changes=[
+            ParameterChange(
+                name="abstract_scoring_max_workers",
+                before=2,
+                after=1,
+                reason="Synthetic test-only worker limit",
+            )
+        ],
+    )
+    store_path.write_text(json.dumps([synthetic_case.to_dict()]), encoding="utf-8")
+
+    input_dir = tmp_path / "driver-input"
+    output_dir = tmp_path / "driver-output"
+    run_dir = (
+        isolated_root
+        / "modules"
+        / "finding"
+        / ".runtime"
+        / "runs"
+        / "find-offline-e2e"
+    )
+    instrumentation_dir = tmp_path / "instrumentation"
+    capture_path = tmp_path / "driver-capture.jsonl"
+    instrumentation_dir.mkdir()
+    fake_entrypoint = isolated_root / "modules" / "finding" / "main.py"
+    fake_entrypoint.parent.mkdir(parents=True)
+    fake_entrypoint.write_text(
+        f'''\
+import argparse
+from datetime import datetime, timezone
+import json
+import sys
+import time
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--action", required=True)
+parser.add_argument("--config-json", required=True)
+parser.add_argument("--input-json", required=True)
+args = parser.parse_args()
+config = json.loads(Path(args.config_json).read_text(encoding="utf-8"))
+input_payload = json.loads(Path(args.input_json).read_text(encoding="utf-8"))
+run_dir = Path({str(run_dir)!r})
+time.sleep(0.2)
+run_dir.mkdir(parents=True)
+print(
+    "TASTE_FIND_EVENT "
+    + json.dumps(
+        {{"event": "find_run_created", "run_id": "find-offline-e2e", "run_dir": str(run_dir)}}
+    ),
+    file=sys.stderr,
+    flush=True,
+)
+(run_dir / "logs").mkdir()
+(run_dir / "logs" / "find_progress.json").write_text(
+    json.dumps(
+        {{
+            "run_id": "find-offline-e2e",
+            "phase": "finding",
+            "counts": {{"candidates": 1}},
+            "live_progress": {{"current": 1, "total": 1, "percent": 100}},
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }}
+    ),
+    encoding="utf-8",
+)
+time.sleep(1.1)
+result = {{
+    "run_id": "find-offline-e2e",
+    "strong_recommendations": [{{"id": "offline-paper", "title": "Offline Paper"}}],
+    "observed_config_path": args.config_json,
+    "observed_input": input_payload,
+    "observed_workers": config["config"]["abstract_scoring_max_workers"],
+    "observed_runtime_tuning": config["config"]["runtime_tuning"],
+}}
+(run_dir / "find_results.json").write_text(json.dumps(result), encoding="utf-8")
+print("fake-find stdout", flush=True)
+print("fake-find stderr", file=sys.stderr, flush=True)
+print(json.dumps({{"run_id": "find-offline-e2e", "run_dir": str(run_dir)}}), flush=True)
+''',
+        encoding="utf-8",
+    )
+    (isolated_root / "modules" / "finding" / "config").mkdir(parents=True)
+    (isolated_root / "modules" / "finding" / "config" / "find.config.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    instrumentation_dir.joinpath("sitecustomize.py").write_text(
+        f'''\
+import atexit
+import json
+import os
+from pathlib import Path
+import subprocess
+
+capture_path = Path(os.environ["OFFLINE_DRIVER_CAPTURE_PATH"])
+active_handles = []
+
+def record(event, **values):
+    with capture_path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({{"event": event, **values}}, sort_keys=True) + "\\n")
+
+original_popen = subprocess.Popen
+def tracked_popen(*args, **kwargs):
+    process = original_popen(*args, **kwargs)
+    record("executor_popen", command=args[0], cwd=kwargs.get("cwd"), pid=process.pid)
+    return process
+subprocess.Popen = tracked_popen
+
+from orchestration import run_frontend
+original_start = run_frontend._start_find_with_executor
+def capture_start(run_context):
+    executor, handle, process = original_start(run_context)
+    active_handles.append(handle)
+    record("start", run_context=run_context.to_dict(), execution_handle=handle.to_dict())
+    return executor, handle, process
+run_frontend._start_find_with_executor = capture_start
+
+from feedback import (
+    FeedbackSupervisor,
+    FileProgressObserver,
+    FindAnomalyBuilder,
+    FindRecoveryController,
+    FindResultValidator,
+)
+
+original_observe = FileProgressObserver.observe
+def capture_observe(self, *args, **kwargs):
+    previous = args[2] if len(args) >= 3 else kwargs.get("previous_snapshot")
+    snapshot = original_observe(self, *args, **kwargs)
+    record(
+        "observer",
+        previous_sequence=None if previous is None else previous.sequence,
+        snapshot=snapshot.to_dict(),
+    )
+    return snapshot
+FileProgressObserver.observe = capture_observe
+
+original_validate = FindResultValidator.validate
+def capture_validate(self, execution_handle):
+    validation = original_validate(self, execution_handle)
+    record("validator", validation=validation.to_dict())
+    return validation
+FindResultValidator.validate = capture_validate
+
+original_build = FindAnomalyBuilder.build
+def capture_build(self, *args, **kwargs):
+    anomaly = original_build(self, *args, **kwargs)
+    progress = kwargs.get("progress_snapshot")
+    record(
+        "anomaly_builder",
+        progress_run_id=None if progress is None else progress.run_id,
+        anomaly=None if anomaly is None else anomaly.to_dict(),
+    )
+    return anomaly
+FindAnomalyBuilder.build = capture_build
+
+original_decide = FindRecoveryController.decide
+def capture_decide(self, *args, **kwargs):
+    decision = original_decide(self, *args, **kwargs)
+    record("controller", decision=decision.to_dict())
+    return decision
+FindRecoveryController.decide = capture_decide
+
+original_monitor = FeedbackSupervisor.on_monitor_tick
+def capture_monitor(self, **kwargs):
+    decision = original_monitor(self, **kwargs)
+    record(
+        "supervisor_monitor",
+        handle=kwargs["execution_handle"].to_dict(),
+        decision=None if decision is None else decision.to_dict(),
+    )
+    return decision
+FeedbackSupervisor.on_monitor_tick = capture_monitor
+
+original_exited = FeedbackSupervisor.on_process_exited
+def capture_exited(self, **kwargs):
+    decision = original_exited(self, **kwargs)
+    record(
+        "supervisor_exited",
+        handle=kwargs["execution_handle"].to_dict(),
+        decision=None if decision is None else decision.to_dict(),
+    )
+    return decision
+FeedbackSupervisor.on_process_exited = capture_exited
+
+@atexit.register
+def capture_completed_handles():
+    for handle in active_handles:
+        record("completed_handle", execution_handle=handle.to_dict())
+''',
+        encoding="utf-8",
+    )
+
+    driver = tmp_path / "generated-driver.py"
+    monkeypatch.setattr(run_frontend, "ROOT", isolated_root)
+    run_frontend.write_driver(
+        driver,
+        project_id,
+        1,
+        1,
+        0,
+        False,
+        False,
+        False,
+        False,
+        source_selection,
+    )
+    driver_env = dict(os.environ)
+    driver_env.update(
+        {
+            "WORKSPACE_ROOT": str(isolated_root),
+            "FINDING_RUNTIME_DIR": str(isolated_root / "modules" / "finding" / ".runtime"),
+            "WORKFLOW_RUNTIME_DIR": str(isolated_root / "modules" / "finding" / ".runtime"),
+            "TASTE_FIND_INPUT_DIR": str(input_dir),
+            "TASTE_INTERNAL_FIND_OUTPUT_DIR": str(output_dir),
+            "OFFLINE_DRIVER_CAPTURE_PATH": str(capture_path),
+            "PYTHONPATH": os.pathsep.join(
+                [str(instrumentation_dir), str(ROOT / "framework" / "scripts")]
+            ),
+        }
+    )
+    try:
+        completed = run_frontend.run(
+            [sys.executable, str(driver)],
+            cwd=isolated_root,
+            env=driver_env,
+            timeout_sec=30,
+        )
+    finally:
+        monkeypatch.setattr(run_frontend, "ROOT", ROOT)
+
+    events = [json.loads(line) for line in capture_path.read_text(encoding="utf-8").splitlines()]
+    started = next(event for event in events if event["event"] == "start")
+    finished = next(event for event in events if event["event"] == "completed_handle")
+    popen_events = [event for event in events if event["event"] == "executor_popen"]
+    monitor_events = [event for event in events if event["event"] == "supervisor_monitor"]
+    exited_events = [event for event in events if event["event"] == "supervisor_exited"]
+    observer_events = [event for event in events if event["event"] == "observer"]
+    validator_events = [event for event in events if event["event"] == "validator"]
+    anomaly_events = [event for event in events if event["event"] == "anomaly_builder"]
+    controller_events = [event for event in events if event["event"] == "controller"]
+    captured_context = started["run_context"]
+    initial_handle = started["execution_handle"]
+    completed_handle = finished["execution_handle"]
+    runtime_config_path = input_dir / "find.config.json"
+    runtime_config = json.loads(runtime_config_path.read_text(encoding="utf-8"))
+    input_payload = json.loads((input_dir / "input.json").read_text(encoding="utf-8"))
+    selection_payload = json.loads((input_dir / "selection.json").read_text(encoding="utf-8"))
+    result_path = run_dir / "find_results.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+
+    assert completed.returncode == 0
+    assert [ref["case_id"] for ref in captured_context["matched_experience_refs"]] == [synthetic_case.case_id]
+    assert [ref["case_id"] for ref in captured_context["applied_experience_refs"]] == [synthetic_case.case_id]
+    assert captured_context["requested_parameters"]["abstract_scoring_max_workers"] == 2
+    assert captured_context["effective_parameters"]["abstract_scoring_max_workers"] == 1
+    assert captured_context["requested_parameters"]["runtime_tuning"]["ABSTRACT_SCORING_MAX_WORKERS"] == "2"
+    assert captured_context["effective_parameters"]["runtime_tuning"]["ABSTRACT_SCORING_MAX_WORKERS"] == "1"
+    assert captured_context["effective_parameters"]["runtime_tuning"]["ABSTRACT_SCORING_WORKER_CAP"] == "1"
+    assert initial_handle["context_id"] == captured_context["context_id"]
+    assert completed_handle["context_id"] == captured_context["context_id"]
+    assert completed_handle["process_alive"] is False
+    assert completed_handle["exit_code"] == 0
+    assert completed_handle["run_id"] == "find-offline-e2e"
+    assert Path(completed_handle["run_dir"]) == run_dir
+    assert len(popen_events) == 1
+    assert monitor_events
+    assert all(event["decision"] is None for event in monitor_events)
+    assert any(event["handle"]["run_id"] is None for event in monitor_events)
+    assert any(
+        event["handle"]["run_id"] == "find-offline-e2e"
+        and event["handle"]["process_alive"] is True
+        for event in monitor_events
+    )
+    assert [event["snapshot"]["sequence"] for event in observer_events] == list(
+        range(len(observer_events))
+    )
+    assert observer_events[0]["snapshot"]["status"] == "starting"
+    assert any(
+        event["snapshot"]["status"] == "running"
+        and event["snapshot"]["run_id"] == "find-offline-e2e"
+        and event["snapshot"]["progress_parse_ok"] is True
+        for event in observer_events
+    )
+    assert [event["previous_sequence"] for event in observer_events] == [
+        None,
+        *range(len(observer_events) - 1),
+    ]
+    assert not any(
+        event["anomaly"] is not None
+        for event in anomaly_events
+        if event["progress_run_id"] == "find-offline-e2e"
+    )
+    assert len(exited_events) == 1
+    assert exited_events[0]["handle"]["run_id"] == "find-offline-e2e"
+    assert Path(exited_events[0]["handle"]["run_dir"]) == run_dir
+    assert exited_events[0]["handle"]["process_alive"] is False
+    assert exited_events[0]["handle"]["exit_code"] == 0
+    assert len(validator_events) == 1
+    assert validator_events[0]["validation"]["status"] == "pass"
+    assert anomaly_events[-1]["anomaly"] is None
+    assert controller_events == []
+    command = popen_events[0]["command"]
+    assert command[command.index("--config-json") + 1] == str(runtime_config_path)
+    assert command[command.index("--input-json") + 1] == str(input_dir / "input.json")
+    assert result["observed_config_path"] == str(runtime_config_path)
+    assert result["observed_workers"] == 1
+    assert result["observed_runtime_tuning"]["ABSTRACT_SCORING_MAX_WORKERS"] == "1"
+    assert result["observed_runtime_tuning"]["ABSTRACT_SCORING_WORKER_CAP"] == "1"
+    assert runtime_config["config"]["abstract_scoring_max_workers"] == 1
+    assert runtime_config["config"]["runtime_tuning"]["ABSTRACT_SCORING_MAX_WORKERS"] == "1"
+    assert "fake-find stdout" in Path(completed_handle["stdout_path"]).read_text(encoding="utf-8")
+    assert "fake-find stderr" in Path(completed_handle["stderr_path"]).read_text(encoding="utf-8")
+    assert result_path.exists()
+    assert result["run_id"] == "find-offline-e2e"
+    assert input_payload == {
+        "research_topic": "Offline generated driver feedback test",
+        "research_interest": "No network is permitted.",
+        "researcher_profile": "",
+        "arxiv_queries": ["offline synthetic query"],
+    }
+    assert selection_payload == source_selection
+    assert project_config_path.read_bytes() == project_config_before
+    assert project_find_config_path.read_bytes() == project_find_config_before
+    assert store_path.is_relative_to(tmp_path)
+    assert runtime_config_path.is_relative_to(tmp_path)
+    assert run_dir.is_relative_to(tmp_path)
+
+
+def _run_generated_driver_terminal_case(tmp_path: Path, monkeypatch, mode: str):
+    from orchestration import run_frontend
+
+    isolated_root = tmp_path / "isolated-taste"
+    isolated_root.mkdir()
+    (isolated_root / "framework").symlink_to(ROOT / "framework", target_is_directory=True)
+    project_id = "offline-lifecycle-terminal"
+    project_root = isolated_root / "projects" / project_id
+    project_root.joinpath("config").mkdir(parents=True)
+    project_root.joinpath("project.json").write_text(
+        json.dumps(
+            {
+                "name": project_id,
+                "topic": "Offline lifecycle terminal test",
+                "user_prompt": "No network is permitted.",
+                "queries": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_selection = {
+        "venue_ids": [],
+        "years": [2026],
+        "venue_years": [],
+        "include_arxiv": False,
+        "include_huggingface": False,
+        "include_github": False,
+        "include_biorxiv": False,
+        "include_nature": False,
+        "include_science": False,
+    }
+    project_root.joinpath("config", "finding.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config": {
+                    "abstract_scoring_max_workers": 1,
+                    "abstract_scoring_batch_size": 1,
+                    "abstract_scoring_timeout_sec": 15,
+                    "arxiv_timeout_sec": 15,
+                },
+                "selection": source_selection,
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime_dir = isolated_root / "modules" / "finding" / ".runtime"
+    decoy_dir = runtime_dir / "latest_run"
+    decoy_dir.mkdir(parents=True)
+    decoy_dir.joinpath("find_results.json").write_text(
+        json.dumps({"run_id": "find-decoy"}),
+        encoding="utf-8",
+    )
+    fake_entrypoint = isolated_root / "modules" / "finding" / "main.py"
+    fake_entrypoint.parent.mkdir(parents=True, exist_ok=True)
+    fake_entrypoint.write_text(
+        f'''\
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--action", required=True)
+parser.add_argument("--config-json", required=True)
+parser.add_argument("--input-json", required=True)
+parser.parse_args()
+mode = {mode!r}
+if mode == "unbound_nonzero":
+    raise SystemExit(9)
+
+runs_dir = Path(os.environ["FINDING_RUNTIME_DIR"]) / "runs"
+run_id = "find-bound-terminal"
+run_dir = runs_dir / run_id
+run_dir.mkdir(parents=True)
+print(
+    "TASTE_FIND_EVENT "
+    + json.dumps({{"event": "find_run_created", "run_id": run_id, "run_dir": str(run_dir)}}),
+    file=sys.stderr,
+    flush=True,
+)
+if mode == "bound_nonzero":
+    raise SystemExit(7)
+
+(run_dir / "find_results.json").write_text(
+    json.dumps(
+        {{
+            "run_id": run_id,
+            "strong_recommendations": [{{"id": "paper-bound", "title": "Bound result"}}],
+        }}
+    ),
+    encoding="utf-8",
+)
+conflict_id = "find-conflicting-final"
+conflict_dir = runs_dir / conflict_id
+conflict_dir.mkdir()
+(conflict_dir / "find_results.json").write_text(
+    json.dumps(
+        {{
+            "run_id": conflict_id,
+            "strong_recommendations": [{{"id": "paper-conflict", "title": "Conflict result"}}],
+        }}
+    ),
+    encoding="utf-8",
+)
+print(json.dumps({{"run_id": conflict_id, "run_dir": str(conflict_dir)}}), flush=True)
+''',
+        encoding="utf-8",
+    )
+    fake_entrypoint.parent.joinpath("config").mkdir()
+    fake_entrypoint.parent.joinpath("config", "find.config.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+
+    capture_path = tmp_path / "terminal-capture.jsonl"
+    instrumentation_dir = tmp_path / "instrumentation"
+    instrumentation_dir.mkdir()
+    instrumentation_dir.joinpath("sitecustomize.py").write_text(
+        '''\
+import atexit
+import json
+import os
+from pathlib import Path
+import subprocess
+
+capture_path = Path(os.environ["LIFECYCLE_CAPTURE_PATH"])
+active_handles = []
+
+def record(event, **values):
+    with capture_path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"event": event, **values}, sort_keys=True) + "\\n")
+
+original_popen = subprocess.Popen
+def tracked_popen(*args, **kwargs):
+    process = original_popen(*args, **kwargs)
+    record("popen", pid=process.pid)
+    return process
+subprocess.Popen = tracked_popen
+
+from orchestration import run_frontend
+original_start = run_frontend._start_find_with_executor
+def capture_start(run_context):
+    executor, handle, process = original_start(run_context)
+    active_handles.append(handle)
+    return executor, handle, process
+run_frontend._start_find_with_executor = capture_start
+
+from feedback import FeedbackSupervisor, FindRecoveryController
+original_exited = FeedbackSupervisor.on_process_exited
+def capture_exited(self, **kwargs):
+    decision = original_exited(self, **kwargs)
+    record(
+        "supervisor_exited",
+        handle=kwargs["execution_handle"].to_dict(),
+        decision=None if decision is None else decision.to_dict(),
+    )
+    return decision
+FeedbackSupervisor.on_process_exited = capture_exited
+
+original_decide = FindRecoveryController.decide
+def capture_decide(self, *args, **kwargs):
+    decision = original_decide(self, *args, **kwargs)
+    record("controller", decision=decision.to_dict())
+    return decision
+FindRecoveryController.decide = capture_decide
+
+from bridges import reading_bridge, sync_outputs
+original_adopt = sync_outputs.adopt_taste_find_run
+def capture_adopt(*args, **kwargs):
+    record("adopt")
+    return original_adopt(*args, **kwargs)
+sync_outputs.adopt_taste_find_run = capture_adopt
+original_read_default = reading_bridge.update_project_read_default_after_find
+def capture_read_default(*args, **kwargs):
+    record("read_default")
+    return original_read_default(*args, **kwargs)
+reading_bridge.update_project_read_default_after_find = capture_read_default
+
+@atexit.register
+def capture_handles():
+    for handle in active_handles:
+        record("completed_handle", handle=handle.to_dict())
+''',
+        encoding="utf-8",
+    )
+
+    driver = tmp_path / "terminal-driver.py"
+    monkeypatch.setattr(run_frontend, "ROOT", isolated_root)
+    run_frontend.write_driver(
+        driver,
+        project_id,
+        1,
+        1,
+        0,
+        False,
+        False,
+        False,
+        False,
+        source_selection,
+    )
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "WORKSPACE_ROOT": str(isolated_root),
+            "FINDING_RUNTIME_DIR": str(runtime_dir),
+            "TASTE_FIND_INPUT_DIR": str(tmp_path / "driver-input"),
+            "TASTE_INTERNAL_FIND_OUTPUT_DIR": str(tmp_path / "driver-output"),
+            "LIFECYCLE_CAPTURE_PATH": str(capture_path),
+            "PYTHONPATH": os.pathsep.join(
+                [str(instrumentation_dir), str(ROOT / "framework" / "scripts")]
+            ),
+        }
+    )
+    completed = run_frontend.run(
+        [sys.executable, str(driver)],
+        cwd=isolated_root,
+        env=environment,
+        timeout_sec=30,
+    )
+    events = [
+        json.loads(line)
+        for line in capture_path.read_text(encoding="utf-8").splitlines()
+    ]
+    return completed, events
+
+
+@pytest.mark.skipif(os.name != "posix", reason="generated driver lifecycle uses POSIX symlinks")
+@pytest.mark.parametrize(
+    ("mode", "expected_exit", "expected_terminal_calls"),
+    [
+        ("bound_nonzero", 7, 1),
+        ("unbound_nonzero", 9, 0),
+        ("identity_conflict", 1, 1),
+    ],
+)
+def test_generated_driver_terminal_lifecycle_preserves_identity_and_exit_code(
+    tmp_path,
+    monkeypatch,
+    mode,
+    expected_exit,
+    expected_terminal_calls,
+):
+    completed, events = _run_generated_driver_terminal_case(
+        tmp_path,
+        monkeypatch,
+        mode,
+    )
+    handles = [event["handle"] for event in events if event["event"] == "completed_handle"]
+    terminal_events = [event for event in events if event["event"] == "supervisor_exited"]
+    controller_events = [event for event in events if event["event"] == "controller"]
+
+    assert completed.returncode == expected_exit
+    assert len([event for event in events if event["event"] == "popen"]) == 1
+    assert len(handles) == 1
+    assert handles[0]["process_alive"] is False
+    assert handles[0]["exit_code"] == (7 if mode == "bound_nonzero" else 9 if mode == "unbound_nonzero" else 0)
+    assert len(terminal_events) == expected_terminal_calls
+    assert len(controller_events) <= 1
+    assert not any(event["event"] in {"adopt", "read_default"} for event in events)
+
+    if mode == "bound_nonzero":
+        assert handles[0]["run_id"] == "find-bound-terminal"
+        assert terminal_events[0]["handle"]["exit_code"] == 7
+        assert terminal_events[0]["decision"] is not None
+        assert len(controller_events) == 1
+    elif mode == "unbound_nonzero":
+        assert handles[0]["run_id"] is None
+        assert handles[0]["run_dir"] is None
+        assert controller_events == []
+        assert "Find exited before run identity was bound" in completed.stdout
+    else:
+        assert handles[0]["run_id"] == "find-bound-terminal"
+        assert "run identity conflicts with the bound Find run" in completed.stdout
+        assert controller_events == []
+
+
+def _make_local_find_run_context(tmp_path: Path, script: str):
+    from feedback import (
+        ArtifactRef,
+        ExperienceQuery,
+        RecoveryAction,
+        RiskLevel,
+        RunContext,
+    )
+
+    workspace = tmp_path / "workspace"
+    entrypoint = workspace / "modules" / "finding" / "main.py"
+    input_dir = tmp_path / "input"
+    entrypoint.parent.mkdir(parents=True)
+    input_dir.mkdir()
+    entrypoint.write_text(script, encoding="utf-8")
+    config_path = input_dir / "find.config.json"
+    input_path = input_dir / "input.json"
+    config_path.write_text('{"schema_version": 1, "config": {}, "selection": {}}\n', encoding="utf-8")
+    input_path.write_text('{"research_topic": "local executor test"}\n', encoding="utf-8")
+    return RunContext(
+        context_id="ctx-local-find",
+        attempt_index=0,
+        project_id="test-project",
+        request_source="cli",
+        created_at=datetime.now(timezone.utc),
+        producer="bridge-tests",
+        producer_version="v1",
+        research_topic="local executor test",
+        selection_snapshot_path=str(input_dir / "selection.json"),
+        selection={"include_arxiv": False},
+        command_redacted=[sys.executable, "modules/finding/main.py", "--action", "find"],
+        working_directory=str(workspace),
+        python_executable=sys.executable,
+        config_snapshot_path=str(config_path),
+        input_snapshot_path=str(input_path),
+        requested_parameters={"abstract_scoring_max_workers": 1},
+        effective_parameters={"abstract_scoring_max_workers": 1},
+        expected_artifacts=[ArtifactRef(role="result", path="find_results.json", required=True)],
+        startup_grace_seconds=30,
+        stall_suspect_seconds=60,
+        stall_confirm_seconds=120,
+        recovery_budget=1,
+        allowed_recovery_actions=[RecoveryAction.RETRY_NEW_RUN],
+        approval_risk_threshold=RiskLevel.MEDIUM,
+        validation_policy_version="find.validation.v1",
+        experience_query=ExperienceQuery(limit=1),
+    )
+
+
+def _make_unbound_execution_handle(tmp_path: Path):
+    from feedback import ExecutionHandle
+
+    return ExecutionHandle(
+        context_id="ctx-find-binding",
+        pid=24680,
+        started_at=datetime.now(timezone.utc),
+        process_alive=True,
+        stdout_path=str(tmp_path / "find.stdout.log"),
+        stderr_path=str(tmp_path / "find.stderr.log"),
+    )
+
+
+def _find_run_created_event(run_id: str, run_dir: Path) -> str:
+    return "TASTE_FIND_EVENT " + json.dumps(
+        {
+            "event": "find_run_created",
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+        },
+        separators=(",", ":"),
+    )
+
+
+def test_find_pipeline_emits_structured_run_identity_before_work(monkeypatch, tmp_path):
+    module_path = ROOT / "modules" / "finding" / "main.py"
+    spec = importlib.util.spec_from_file_location("finding_lifecycle_event_test", module_path)
+    assert spec and spec.loader
+    finding_main = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(finding_main)
+    pipeline = finding_main._private_import("flow.pipeline")
+    models = finding_main._private_import("finding_runtime.models")
+    run_id = "find_lifecycle_event"
+    run_dir = tmp_path / "runtime" / "runs" / run_id
+    messages: list[str] = []
+
+    class StopAfterRunCreated(Exception):
+        pass
+
+    def create_run_dir(_prefix="find"):
+        run_dir.mkdir(parents=True)
+        return run_id, run_dir
+
+    def stop_before_external_work(*_args, **_kwargs):
+        raise StopAfterRunCreated
+
+    monkeypatch.setattr(pipeline, "create_run_dir", create_run_dir)
+    monkeypatch.setattr(pipeline, "LLMClient", stop_before_external_work)
+    request = models.FindRequest(
+        config=models.AppConfig(provider="mock"),
+        selection=models.VenueSelection(
+            venue_ids=[],
+            years=[],
+            venue_years=[],
+            include_arxiv=False,
+            include_biorxiv=False,
+            include_huggingface=False,
+            include_github=False,
+            include_nature=False,
+            include_science=False,
+        ),
+    )
+
+    with pytest.raises(StopAfterRunCreated):
+        pipeline.run_find(request, log=messages.append)
+
+    event_index = next(
+        index for index, message in enumerate(messages)
+        if message.startswith("TASTE_FIND_EVENT ")
+    )
+    created_index = messages.index(f"Created run {run_id}")
+    payload = json.loads(messages[event_index].removeprefix("TASTE_FIND_EVENT "))
+    assert event_index < created_index
+    assert payload == {
+        "event": "find_run_created",
+        "run_id": run_id,
+        "run_dir": str(run_dir.resolve()),
+    }
+
+
+def test_find_run_binding_parser_accepts_complete_split_and_multiline_events(tmp_path):
+    from orchestration import run_frontend
+
+    runs_dir = tmp_path / "runtime" / "runs"
+    first_dir = runs_dir / "find_complete"
+    first_dir.mkdir(parents=True)
+    complete_handle = _make_unbound_execution_handle(tmp_path)
+    complete_parser = run_frontend._FindRunBindingParser(runs_dir)
+    event = _find_run_created_event("find_complete", first_dir) + "\n"
+
+    assert complete_parser.consume(event, execution_handle=complete_handle) is False
+    assert (complete_handle.run_id, Path(complete_handle.run_dir or "")) == (
+        "find_complete",
+        first_dir.resolve(),
+    )
+
+    split_dir = runs_dir / "find_split"
+    split_dir.mkdir()
+    split_handle = _make_unbound_execution_handle(tmp_path)
+    split_parser = run_frontend._FindRunBindingParser(runs_dir)
+    split_event = _find_run_created_event("find_split", split_dir) + "\n"
+    midpoint = len(split_event) // 2
+    assert split_parser.consume(
+        "ordinary log\n" + split_event[:midpoint],
+        execution_handle=split_handle,
+    ) is False
+    assert split_handle.run_id is None
+    assert split_parser.consume(
+        split_event[midpoint:] + "another log\n",
+        execution_handle=split_handle,
+    ) is False
+    assert (split_handle.run_id, Path(split_handle.run_dir or "")) == (
+        "find_split",
+        split_dir.resolve(),
+    )
+
+
+def test_find_run_binding_parser_ignores_human_logs_and_unprefixed_json(tmp_path):
+    from orchestration import run_frontend
+
+    runs_dir = tmp_path / "runtime" / "runs"
+    runs_dir.mkdir(parents=True)
+    handle = _make_unbound_execution_handle(tmp_path)
+    parser = run_frontend._FindRunBindingParser(runs_dir)
+
+    assert parser.consume(
+        'Created run find_human\n{"event":"find_run_created","run_id":"find_human"}\n',
+        execution_handle=handle,
+    ) is False
+    assert handle.run_id is None
+    assert handle.run_dir is None
+
+
+@pytest.mark.parametrize(
+    "event_factory",
+    [
+        lambda runs_dir: "TASTE_FIND_EVENT {broken-json}\n",
+        lambda runs_dir: _find_run_created_event(
+            "find_outside",
+            runs_dir.parent / "outside" / "find_outside",
+        ) + "\n",
+        lambda runs_dir: _find_run_created_event(
+            "find_expected",
+            runs_dir / "find_other",
+        ) + "\n",
+    ],
+)
+def test_find_run_binding_parser_rejects_invalid_identity_without_binding(
+    tmp_path,
+    event_factory,
+):
+    from orchestration import run_frontend
+
+    runs_dir = tmp_path / "runtime" / "runs"
+    (runs_dir.parent / "outside" / "find_outside").mkdir(parents=True)
+    (runs_dir / "find_other").mkdir(parents=True)
+    handle = _make_unbound_execution_handle(tmp_path)
+    parser = run_frontend._FindRunBindingParser(runs_dir)
+
+    assert parser.consume(
+        event_factory(runs_dir),
+        execution_handle=handle,
+    ) is True
+    assert handle.run_id is None
+    assert handle.run_dir is None
+
+
+def test_find_run_binding_parser_ignores_duplicate_and_rejects_conflict(tmp_path):
+    from orchestration import run_frontend
+
+    runs_dir = tmp_path / "runtime" / "runs"
+    original_dir = runs_dir / "find_original"
+    conflict_dir = runs_dir / "find_conflict"
+    original_dir.mkdir(parents=True)
+    conflict_dir.mkdir()
+    handle = _make_unbound_execution_handle(tmp_path)
+    parser = run_frontend._FindRunBindingParser(runs_dir)
+    original_event = _find_run_created_event("find_original", original_dir) + "\n"
+
+    assert parser.consume(original_event, execution_handle=handle) is False
+    assert parser.consume(original_event, execution_handle=handle) is False
+    assert parser.consume(
+        _find_run_created_event("find_conflict", conflict_dir) + "\n",
+        execution_handle=handle,
+    ) is True
+    assert (handle.run_id, Path(handle.run_dir or "")) == (
+        "find_original",
+        original_dir.resolve(),
+    )
+
+
+def test_find_run_binding_parser_bounds_unfinished_event_buffer(tmp_path):
+    from orchestration import run_frontend
+
+    runs_dir = tmp_path / "runtime" / "runs"
+    runs_dir.mkdir(parents=True)
+    handle = _make_unbound_execution_handle(tmp_path)
+    parser = run_frontend._FindRunBindingParser(runs_dir)
+
+    assert parser.consume(
+        "TASTE_FIND_EVENT " + "x" * (64 * 1024 + 1),
+        execution_handle=handle,
+    ) is True
+    assert handle.run_id is None
+
+
+def _stop_test_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.kill()
+        process.wait()
+
+
+def _write_executor_find_with_sleeping_descendant(
+    tmp_path: Path,
+    *,
+    exit_code: int | None = None,
+) -> tuple[Path, str]:
+    pids_path = tmp_path / "executor-find-pids.json"
+    exit_statement = "" if exit_code is None else f"\nsys.exit({exit_code})\n"
+    script = f'''\
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+Path({str(pids_path)!r}).write_text(
+    json.dumps({{"find": os.getpid(), "child": child.pid}}),
+    encoding="utf-8",
+)
+print("executor find ready", flush=True)
+{exit_statement}time.sleep(30)
+'''
+    return pids_path, script
+
+
+def _write_executor_driver(
+    tmp_path: Path,
+    find_script: str,
+    *,
+    fail_after_start: bool = False,
+    find_ready_path: Path | None = None,
+) -> Path:
+    workspace = tmp_path / "driver-workspace"
+    entrypoint = workspace / "modules" / "finding" / "main.py"
+    input_dir = tmp_path / "driver-input"
+    entrypoint.parent.mkdir(parents=True)
+    input_dir.mkdir()
+    entrypoint.write_text(find_script, encoding="utf-8")
+    config_path = input_dir / "find.config.json"
+    input_path = input_dir / "input.json"
+    config_path.write_text('{"schema_version": 1, "config": {}, "selection": {}}\n', encoding="utf-8")
+    input_path.write_text('{"research_topic": "local executor test"}\n', encoding="utf-8")
+    driver = tmp_path / "executor-driver.py"
+    driver.write_text(
+        f'''\
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, {str(ROOT / "framework" / "scripts")!r})
+from feedback import ArtifactRef, ExperienceQuery, RecoveryAction, RiskLevel, RunContext
+from orchestration.run_frontend import (
+    _consume_execution_logs,
+    _register_find_process_exit_cleanup,
+    _start_find_with_executor,
+)
+
+workspace = Path({str(workspace)!r})
+input_dir = Path({str(input_dir)!r})
+run_context = RunContext(
+    context_id="ctx-driver-find",
+    attempt_index=0,
+    project_id="test-project",
+    request_source="cli",
+    created_at=datetime.now(timezone.utc),
+    producer="bridge-tests",
+    producer_version="v1",
+    research_topic="local executor test",
+    selection_snapshot_path=str(input_dir / "selection.json"),
+    selection={{"include_arxiv": False}},
+    command_redacted=[sys.executable, "modules/finding/main.py", "--action", "find"],
+    working_directory=str(workspace),
+    python_executable=sys.executable,
+    config_snapshot_path=str(input_dir / "find.config.json"),
+    input_snapshot_path=str(input_dir / "input.json"),
+    requested_parameters={{"abstract_scoring_max_workers": 1}},
+    effective_parameters={{"abstract_scoring_max_workers": 1}},
+    expected_artifacts=[ArtifactRef(role="result", path="find_results.json", required=True)],
+    startup_grace_seconds=30,
+    stall_suspect_seconds=60,
+    stall_confirm_seconds=120,
+    recovery_budget=1,
+    allowed_recovery_actions=[RecoveryAction.RETRY_NEW_RUN],
+    approval_risk_threshold=RiskLevel.MEDIUM,
+    validation_policy_version="find.validation.v1",
+    experience_query=ExperienceQuery(limit=1),
+)
+_, execution_handle, process = _start_find_with_executor(run_context)
+_register_find_process_exit_cleanup(process)
+if {fail_after_start!r}:
+    ready_path = Path({str(find_ready_path) if find_ready_path is not None else ''!r})
+    deadline = time.monotonic() + 5
+    while not ready_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not ready_path.exists():
+        raise RuntimeError("fake Find did not start before driver failure")
+    raise RuntimeError("intentional driver failure after Find launch")
+_consume_execution_logs(process, execution_handle, lambda _text: None, poll_interval=0.01)
+raise SystemExit(execution_handle.exit_code or 0)
+''',
+        encoding="utf-8",
+    )
+    return driver
+
+
+def test_run_frontend_consumes_split_executor_logs_and_parses_stdout_result(tmp_path):
+    from orchestration import run_frontend
+
+    run_dir = tmp_path / "find-run"
+    script = f'''\
+import json
+import sys
+import time
+from pathlib import Path
+
+run_dir = Path({str(run_dir)!r})
+run_dir.mkdir(parents=True)
+binding = "运行绑定".encode("utf-8")
+sys.stderr.buffer.write(binding[:2])
+sys.stderr.buffer.flush()
+time.sleep(0.08)
+sys.stderr.buffer.write(binding[2:] + b" from stderr\\n")
+sys.stderr.buffer.flush()
+sys.stdout.write("stdout before final payload\\n")
+sys.stdout.flush()
+time.sleep(0.08)
+(run_dir / "find_results.json").write_text(json.dumps({{"run_id": "find-local", "ok": True}}), encoding="utf-8")
+sys.stdout.write("tail-without-newline" + json.dumps({{"run_id": "find-local", "run_dir": str(run_dir)}}))
+sys.stdout.flush()
+'''
+    run_context = _make_local_find_run_context(tmp_path, script)
+    emitted: list[str] = []
+    _, execution_handle, process = run_frontend._start_find_with_executor(run_context)
+    try:
+        stdout_output = run_frontend._consume_execution_logs(
+            process,
+            execution_handle,
+            emitted.append,
+            poll_interval=0.01,
+        )
+    finally:
+        _stop_test_process(process)
+
+    assert execution_handle.process_alive is False
+    assert execution_handle.exit_code == 0
+    assert "运行绑定 from stderr" in "".join(emitted)
+    assert "运行绑定" not in stdout_output
+    assert "tail-without-newline" in stdout_output
+    run_id, directory, result = run_frontend._parse_find_cli_result(
+        stdout_output,
+        tmp_path / "finding-module",
+    )
+    assert (run_id, directory, result) == ("find-local", run_dir, {"run_id": "find-local", "ok": True})
+
+
+def test_run_frontend_execution_log_monitor_callback_is_optional_and_throttled(tmp_path):
+    from orchestration import run_frontend
+
+    signature = inspect.signature(run_frontend._consume_execution_logs)
+    assert signature.parameters["on_monitor_tick"].default is None
+
+    script = '''\
+import sys
+import time
+for index in range(20):
+    print(f"stdout-{index}", flush=True)
+    print(f"stderr-{index}", file=sys.stderr, flush=True)
+    time.sleep(0.01)
+'''
+    run_context = _make_local_find_run_context(tmp_path, script)
+    _, execution_handle, process = run_frontend._start_find_with_executor(run_context)
+    callback_handles = []
+    try:
+        stdout_output = run_frontend._consume_execution_logs(
+            process,
+            execution_handle,
+            lambda _text: None,
+            poll_interval=0.002,
+            on_monitor_tick=callback_handles.append,
+        )
+    finally:
+        _stop_test_process(process)
+
+    assert "stdout-19" in stdout_output
+    assert callback_handles == [execution_handle]
+    assert execution_handle.process_alive is False
+    assert execution_handle.exit_code == 0
+
+
+def test_run_frontend_monitor_callback_failure_is_sanitized_and_does_not_interrupt_logs(tmp_path):
+    from orchestration import run_frontend
+
+    run_context = _make_local_find_run_context(
+        tmp_path,
+        'print("fake Find completed", flush=True)\n',
+    )
+    _, execution_handle, process = run_frontend._start_find_with_executor(run_context)
+    emitted: list[str] = []
+    callback_calls = 0
+
+    def fail_monitor(_handle):
+        nonlocal callback_calls
+        callback_calls += 1
+        raise RuntimeError("private callback detail")
+
+    try:
+        stdout_output = run_frontend._consume_execution_logs(
+            process,
+            execution_handle,
+            emitted.append,
+            poll_interval=0.002,
+            on_monitor_tick=fail_monitor,
+        )
+    finally:
+        _stop_test_process(process)
+
+    assert callback_calls == 1
+    assert "fake Find completed" in stdout_output
+    assert "Feedback monitor callback failed: RuntimeError" in "".join(emitted)
+    assert "private callback detail" not in "".join(emitted)
+    assert execution_handle.process_alive is False
+    assert execution_handle.exit_code == 0
+    assert process.poll() == 0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-tree cleanup is verified in the WSL/POSIX runtime")
+def test_run_frontend_execution_log_failure_stops_find_and_its_descendant(tmp_path):
+    from orchestration import run_frontend
+
+    pids_path, script = _write_executor_find_with_sleeping_descendant(tmp_path)
+    run_context = _make_local_find_run_context(
+        tmp_path,
+        script,
+    )
+    _, execution_handle, process = run_frontend._start_find_with_executor(run_context)
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        with pytest.raises(OSError, match="log consumer"):
+            run_frontend._consume_execution_logs(
+                process,
+                execution_handle,
+                lambda _text: (_ for _ in ()).throw(OSError("log consumer failed")),
+                poll_interval=0.01,
+            )
+        _assert_owned_pids_exit(_read_owned_test_pids(pids_path))
+        assert unrelated.poll() is None
+    finally:
+        _stop_test_process(process)
+        _stop_test_process(unrelated)
+
+    assert process.poll() is not None
+    assert execution_handle.process_alive is False
+    assert execution_handle.exit_code is not None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-tree cleanup is verified in the WSL/POSIX runtime")
+def test_run_frontend_nonzero_find_exit_stops_its_descendant(tmp_path):
+    from orchestration import run_frontend
+
+    pids_path, script = _write_executor_find_with_sleeping_descendant(tmp_path, exit_code=7)
+    driver = _write_executor_driver(tmp_path, script)
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        result = run_frontend.run([sys.executable, str(driver)], timeout_sec=30)
+        _assert_owned_pids_exit(_read_owned_test_pids(pids_path))
+        assert unrelated.poll() is None
+    finally:
+        _stop_test_process(unrelated)
+
+    assert result.returncode == 7
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is verified in the WSL/POSIX runtime")
+def test_run_frontend_driver_exception_stops_find_and_its_descendant(tmp_path):
+    from orchestration import run_frontend
+
+    pids_path, script = _write_executor_find_with_sleeping_descendant(tmp_path)
+    driver = _write_executor_driver(
+        tmp_path,
+        script,
+        fail_after_start=True,
+        find_ready_path=pids_path,
+    )
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        result = run_frontend.run([sys.executable, str(driver)], timeout_sec=30)
+        _assert_owned_pids_exit(_read_owned_test_pids(pids_path))
+        assert unrelated.poll() is None
+    finally:
+        _stop_test_process(unrelated)
+
+    assert result.returncode != 0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is verified in the WSL/POSIX runtime")
+def test_stop_find_process_escalates_from_terminate_to_kill(monkeypatch):
+    from orchestration import run_frontend
+
+    class FakeProcess:
+        pid = 424242
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -signal.SIGKILL
+
+        def kill(self):
+            raise AssertionError("group escalation should finish before direct kill")
+
+    signals: list[int] = []
+    waits = iter([{FakeProcess.pid}, set()])
+    monkeypatch.setattr(run_frontend, "_owned_find_process_pids", lambda _process: {FakeProcess.pid})
+    monkeypatch.setattr(
+        run_frontend,
+        "_wait_for_posix_pids_to_exit",
+        lambda _pids, _timeout: next(waits),
+    )
+    monkeypatch.setattr(
+        run_frontend.os,
+        "kill",
+        lambda _pid, signal_number: signals.append(signal_number),
+    )
+
+    assert run_frontend._stop_find_process(FakeProcess()) == -signal.SIGKILL
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_run_frontend_rejects_missing_or_invalid_current_find_result(tmp_path):
+    from orchestration import run_frontend
+
+    with pytest.raises(RuntimeError, match="did not return run_id/run_dir"):
+        run_frontend._parse_find_cli_result("not json", tmp_path)
+
+    missing_dir = tmp_path / "missing-result"
+    missing_dir.mkdir()
+    missing_payload = json.dumps({"run_id": "find-missing", "run_dir": str(missing_dir)})
+    with pytest.raises(RuntimeError, match="find_results.json is missing"):
+        run_frontend._parse_find_cli_result(missing_payload, tmp_path)
+
+    invalid_dir = tmp_path / "invalid-result"
+    invalid_dir.mkdir()
+    (invalid_dir / "find_results.json").write_text("[]", encoding="utf-8")
+    invalid_payload = json.dumps({"run_id": "find-invalid", "run_dir": str(invalid_dir)})
+    with pytest.raises(RuntimeError, match="non-object find_results"):
+        run_frontend._parse_find_cli_result(invalid_payload, tmp_path)
+
+
+def test_run_frontend_executor_start_helper_starts_once(monkeypatch, tmp_path):
+    from feedback import ExecutionHandle
+    from orchestration import run_frontend
+
+    class FakeProcess:
+        pid = 2468
+
+    class FakeExecutor:
+        executes = 0
+        handoffs = 0
+
+        def __init__(self):
+            self.execution_handle = None
+            self.process = None
+
+        def execute(self, run_context):
+            type(self).executes += 1
+            self.execution_handle = ExecutionHandle(
+                context_id=run_context.context_id,
+                pid=FakeProcess.pid,
+                started_at=datetime.now(timezone.utc),
+                process_alive=True,
+                stdout_path=str(tmp_path / "stdout.log"),
+                stderr_path=str(tmp_path / "stderr.log"),
+            )
+            self.process = FakeProcess()
+            return self.execution_handle
+
+        def get_process(self, execution_handle):
+            type(self).handoffs += 1
+            assert execution_handle is self.execution_handle
+            assert execution_handle.context_id == run_context.context_id
+            return self.process
+
+    monkeypatch.setattr(run_frontend, "SubprocessFindExecutor", FakeExecutor)
+    run_context = _make_local_find_run_context(tmp_path, "print('unused')\n")
+
+    executor, execution_handle, process = run_frontend._start_find_with_executor(run_context)
+
+    assert isinstance(executor, FakeExecutor)
+    assert execution_handle.pid == process.pid == FakeProcess.pid
+    assert execution_handle.context_id == run_context.context_id
+    assert FakeExecutor.executes == 1
+    assert FakeExecutor.handoffs == 1
+
+
+def _write_process_tree_driver(tmp_path: Path) -> tuple[Path, Path]:
+    pids_path = tmp_path / "pids.json"
+    grandchild = tmp_path / "grandchild.py"
+    fake_find = tmp_path / "fake_find.py"
+    driver = tmp_path / "driver.py"
+    grandchild.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    fake_find.write_text(
+        "import json, os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        f"child = subprocess.Popen([sys.executable, {str(grandchild)!r}])\n"
+        f"Path({str(pids_path)!r}).write_text(json.dumps({{'find': os.getpid(), 'grandchild': child.pid}}), encoding='utf-8')\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    driver.write_text(
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(fake_find)!r}])\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    return driver, pids_path
+
+
+def _read_owned_test_pids(path: Path) -> list[int]:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if path.exists():
+            return [int(value) for value in json.loads(path.read_text(encoding="utf-8")).values()]
+        time.sleep(0.02)
+    pytest.fail("fake Find process tree did not record its owned PIDs")
+
+
+def _assert_owned_pids_exit(pids: list[int]) -> None:
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline:
+            if os.name == "posix":
+                from orchestration import run_frontend
+
+                remaining = list(run_frontend._live_posix_pids(set(pids)))
+            else:
+                remaining = []
+                for pid in pids:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        continue
+                    remaining.append(pid)
+            if not remaining:
+                return
+            time.sleep(0.05)
+        pytest.fail("owned fake Find process remained after cleanup: " + str(remaining))
+    finally:
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is verified in the WSL/POSIX runtime")
+def test_run_frontend_timeout_terminates_driver_find_and_descendant(tmp_path):
+    from orchestration import run_frontend
+
+    driver, pids_path = _write_process_tree_driver(tmp_path)
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_frontend.run([sys.executable, str(driver)], timeout_sec=15)
+    _assert_owned_pids_exit(_read_owned_test_pids(pids_path))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is verified in the WSL/POSIX runtime")
+def test_run_frontend_cancellation_terminates_driver_find_and_descendant(monkeypatch, tmp_path):
+    from orchestration import run_frontend
+
+    driver, pids_path = _write_process_tree_driver(tmp_path)
+    original_select = run_frontend.select.select
+
+    def cancel_after_find_starts(*args, **kwargs):
+        if pids_path.exists():
+            raise KeyboardInterrupt
+        return original_select(*args, **kwargs)
+
+    monkeypatch.setattr(run_frontend.select, "select", cancel_after_find_starts)
+    with pytest.raises(KeyboardInterrupt):
+        run_frontend.run([sys.executable, str(driver)], timeout_sec=15)
+    _assert_owned_pids_exit(_read_owned_test_pids(pids_path))
+
+
+def test_full_cycle_marks_its_find_request_source():
+    source = (ROOT / "framework" / "scripts" / "orchestration" / "run_project.py").read_text(encoding="utf-8")
+
+    assert "'--request-source',\n                    'full_cycle'," in source
 
 
 def test_web_find_settings_do_not_implicitly_force_deep_survey():
@@ -4227,10 +5974,13 @@ def test_dynamic_source_status_is_not_normalized_as_venue_metadata():
     assert rows["biorxiv"]["raw_count"] == 16602
 
 
-def test_web_jobs_keeps_only_latest_persisted_environment_history(monkeypatch):
+def test_web_jobs_keeps_only_latest_persisted_environment_history(monkeypatch, tmp_path):
     from auto_research.web import server as web_server
 
     web_server._LIVE_JOBS_CACHE.clear()
+    projects = tmp_path / "projects"
+    (projects / "demo").mkdir(parents=True)
+    monkeypatch.setattr(web_server, "PROJECT_IDS_ROOT", projects)
     monkeypatch.setattr(web_server, "_reconcile_detached_launcher_jobs", lambda dynamic=None: None)
     monkeypatch.setattr(web_server, "_reconcile_stale_cancelling_jobs", lambda: None)
     monkeypatch.setattr(web_server, "_live_jobs_from_projects", lambda compact=True: [])
@@ -4255,6 +6005,32 @@ def test_web_jobs_keeps_only_latest_persisted_environment_history(monkeypatch):
     env_rows = [row for row in rows if row.get("stage") == "environment"]
     assert [row["job_id"] for row in env_rows] == ["environment_new"]
     assert "success_criteria 空数组" not in json.dumps(rows, ensure_ascii=False)
+
+
+def test_web_jobs_hides_persisted_environment_history_for_missing_project(monkeypatch, tmp_path):
+    from auto_research.web import server as web_server
+
+    web_server._LIVE_JOBS_CACHE.clear()
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    monkeypatch.setattr(web_server, "PROJECT_IDS_ROOT", projects)
+    monkeypatch.setattr(web_server, "_reconcile_detached_launcher_jobs", lambda dynamic=None: None)
+    monkeypatch.setattr(web_server, "_reconcile_stale_cancelling_jobs", lambda: None)
+    monkeypatch.setattr(web_server, "_live_jobs_from_projects", lambda compact=True: [])
+    monkeypatch.setattr(web_server, "_find_run_history_jobs_from_runs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(web_server, "_current_find_downstream_stage_history_jobs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(web_server, "_environment_decision_public_projection", lambda *args, **kwargs: {})
+
+    historical = web_server.JobState("environment_missing_project", "environment")
+    historical.status = "blocked"
+    historical.created_at = "2026-06-21T05:55:29Z"
+    historical.run_id = "web_environment_demo_20260621T054118Z"
+    historical.result = {"project": "demo", "status": "blocked"}
+    monkeypatch.setattr(web_server, "JOBS", {historical.job_id: historical})
+
+    rows = web_server.api_jobs(compact=True, limit=10, include_history=True, project="demo")
+
+    assert [row for row in rows if row.get("stage") == "environment"] == []
 
 
 def test_web_current_find_pending_read_blocker_is_not_environment_ready():

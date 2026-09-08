@@ -8436,6 +8436,18 @@ def run_find(
     if config.default_find_selection != selection_payload:
         config = config.model_copy(update={"default_find_selection": selection_payload})
     run_id, run_dir = create_run_dir("find")
+    log(
+        "TASTE_FIND_EVENT "
+        + json.dumps(
+            {
+                "event": "find_run_created",
+                "run_id": run_id,
+                "run_dir": str(run_dir.resolve()),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
     config_snapshot = redacted_config(config.model_dump())
     input_snapshot = {
         key: config_snapshot.get(key)

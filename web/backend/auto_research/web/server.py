@@ -11318,11 +11318,16 @@ def api_find(request: FindRequest) -> dict:
         payload = {
             "action": "find",
             "project": project_id,
+            "request_source": "web",
             "web_job_id": job_id,
             "max_papers": int(config.max_recommended_papers or 20),
             "max_ideas": int(config.max_ideas or 6),
             "queries": [str(query).strip() for query in (config.arxiv_queries or []) if str(query).strip()],
             "selection": selection,
+            "force_new_find": request.force_new_find,
+            "restart_full_cycle": request.restart_full_cycle,
+            "human_approved_new_find": request.human_approved_new_find,
+            "approval_reason": str(request.approval_reason or "").strip(),
             "runtime_env": runtime_env_for_find(),
         }
         result = run_action(payload, log, should_cancel, progress)

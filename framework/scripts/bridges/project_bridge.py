@@ -13277,6 +13277,15 @@ def build_command(payload: dict[str, Any]) -> tuple[str, list[str]]:
         if payload.get("timeout_sec") is not None:
             cmd.extend(["--timeout-sec", str(max(0, int(payload["timeout_sec"])))])
         _append(cmd, "--web-job-id", payload.get("web_job_id"))
+        _append(cmd, "--request-source", payload.get("request_source"))
+        for key, flag in [
+            ("force_new_find", "--force-new-find"),
+            ("restart_full_cycle", "--restart-full-cycle"),
+            ("human_approved_new_find", "--human-approved-new-find"),
+        ]:
+            if payload.get(key):
+                cmd.append(flag)
+        _append(cmd, "--approval-reason", payload.get("approval_reason"))
         selection = payload.get("selection")
         if isinstance(selection, dict):
             cmd.extend([

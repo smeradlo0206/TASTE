@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-17T08:12:18.700649+00:00",
+  "generated_at": "2026-09-08T04:58:14.707617+00:00",
   "module": "framework",
   "backend_only": true,
   "frontend_dependency": false,
@@ -17,11 +17,12 @@
   "canonical_entrypoints": [
     "scripts/main.py"
   ],
-  "script_count": 87,
+  "script_count": 103,
   "categories": [
     "automation",
     "bridges",
     "contracts",
+    "feedback",
     "integrations",
     "launchers",
     "orchestration",
@@ -1179,6 +1180,531 @@
       "class_count": 14
     },
     {
+      "path": "scripts/feedback/__init__.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [],
+      "classes": [],
+      "imports": [
+        "advisor",
+        "anomaly",
+        "approval",
+        "contracts",
+        "controller",
+        "executor",
+        "experience_store",
+        "feedback_adapter",
+        "interfaces",
+        "observer",
+        "query_builder",
+        "request_builder",
+        "state_machine",
+        "supervisor",
+        "validator"
+      ],
+      "function_count": 0,
+      "class_count": 0
+    },
+    {
+      "path": "scripts/feedback/advisor.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "_utc_now",
+        "_new_proposal_id",
+        "_is_sensitive_key",
+        "_redact_text",
+        "_safe_json_summary",
+        "_evidence_index",
+        "_experience_summary",
+        "_build_prompt",
+        "_validate_response",
+        "_is_client_response_extraction_failure",
+        "_select_evidence",
+        "__init__",
+        "propose"
+      ],
+      "classes": [
+        "LLMRecoveryAdvisor"
+      ],
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "contracts",
+        "datetime",
+        "integrations.web_llm",
+        "json",
+        "uuid"
+      ],
+      "function_count": 13,
+      "class_count": 1
+    },
+    {
+      "path": "scripts/feedback/anomaly.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "_progress_artifact",
+        "_progress_kind",
+        "_check_status",
+        "_blocked_codes",
+        "_validation_kind",
+        "_evidence_key",
+        "_copy_evidence",
+        "_append_evidence",
+        "_artifact_evidence",
+        "_collect_evidence",
+        "_unique_strings",
+        "_symptoms",
+        "_artifact_facts",
+        "_optional_anomaly_fields",
+        "build"
+      ],
+      "classes": [
+        "FindAnomalyBuilder"
+      ],
+      "imports": [
+        "__future__",
+        "contracts",
+        "uuid"
+      ],
+      "function_count": 15,
+      "class_count": 1
+    },
+    {
+      "path": "scripts/feedback/approval.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "_utc_now",
+        "_new_run_id",
+        "_validated_copy",
+        "_require_non_empty_text",
+        "_validate_pending",
+        "_validate_candidate",
+        "resolve"
+      ],
+      "classes": [
+        "FindRecoveryApprovalGate"
+      ],
+      "imports": [
+        "__future__",
+        "contracts",
+        "dataclasses",
+        "datetime",
+        "uuid"
+      ],
+      "function_count": 7,
+      "class_count": 1
+    },
+    {
+      "path": "scripts/feedback/contracts.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "_error",
+        "_child_path",
+        "_require_aware_datetime",
+        "_to_json_value",
+        "_from_json_value",
+        "_from_dataclass",
+        "_require_string",
+        "_optional_string",
+        "_require_bool",
+        "_copy_json_compatible",
+        "_contains_secret",
+        "_require_mapping",
+        "_require_list",
+        "_require_non_empty_string",
+        "_reject_secret_in_value",
+        "_require_non_negative_int",
+        "_require_non_negative_number",
+        "_copy_string_list",
+        "_copy_mapping_list",
+        "to_dict",
+        "from_dict",
+        "to_json",
+        "from_json",
+        "__post_init__",
+        "__post_init__",
+        "__post_init__",
+        "__post_init__",
+        "__post_init__",
+        "__post_init__",
+        "__post_init__",
+        "__post_init__",
+        "__post_init__",
+        "__post_init__",
+        "_copy_typed_list",
+        "__post_init__",
+        "__post_init__",
+        "_copy_typed_list",
+        "__post_init__",
+        "_copy_typed_list",
+        "_count_field_name",
+        "__post_init__",
+        "_copy_evidence_refs",
+        "__post_init__",
+        "__post_init__",
+        "_copy_typed_list",
+        "__post_init__",
+        "_copy_typed_list",
+        "__post_init__",
+        "_copy_events"
+      ],
+      "classes": [
+        "JsonContract",
+        "ProgressStatus",
+        "ValidationStatus",
+        "RecoveryAction",
+        "SupervisorStatus",
+        "SupervisorEventType",
+        "RiskLevel",
+        "ArtifactRef",
+        "EvidenceRef",
+        "ExperienceRef",
+        "ParameterChange",
+        "ValidationCheck",
+        "SupervisorEvent",
+        "FindStageRequest",
+        "ExperienceQuery",
+        "RecoveryExperienceQuery",
+        "RunContext",
+        "ExecutionHandle",
+        "ProgressSnapshot",
+        "ValidationResult",
+        "Anomaly",
+        "RecoveryProposal",
+        "RecoveryDecision",
+        "ExperienceCase",
+        "SupervisorState"
+      ],
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "copy",
+        "dataclasses",
+        "datetime",
+        "enum",
+        "json",
+        "math",
+        "types",
+        "typing"
+      ],
+      "function_count": 49,
+      "class_count": 25
+    },
+    {
+      "path": "scripts/feedback/controller.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "_utc_now",
+        "_new_decision_id",
+        "_new_run_id",
+        "_experience_ref",
+        "_normalized_tags",
+        "_parameter_changes_are_safe",
+        "_proposal_parameter_changes",
+        "__init__",
+        "decide",
+        "_validate_inputs",
+        "_hard_stop_reason",
+        "_action_rejection_reason",
+        "_experience_rejection_reason",
+        "_decision_from_experience",
+        "_decision_from_proposal",
+        "_proposal_rejection_reason",
+        "_build_decision"
+      ],
+      "classes": [
+        "FindRecoveryController"
+      ],
+      "imports": [
+        "__future__",
+        "contracts",
+        "copy",
+        "datetime",
+        "feedback_adapter",
+        "interfaces",
+        "query_builder",
+        "uuid"
+      ],
+      "function_count": 17,
+      "class_count": 1
+    },
+    {
+      "path": "scripts/feedback/executor.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "__init__",
+        "execute",
+        "get_process",
+        "_start_process"
+      ],
+      "classes": [
+        "SubprocessFindExecutor"
+      ],
+      "imports": [
+        "__future__",
+        "contracts",
+        "datetime",
+        "pathlib",
+        "subprocess",
+        "threading"
+      ],
+      "function_count": 4,
+      "class_count": 1
+    },
+    {
+      "path": "scripts/feedback/experience_store.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "_normalized_tags",
+        "select_experience_cases",
+        "__init__",
+        "_load_cases",
+        "search_cases",
+        "search_recovery_cases"
+      ],
+      "classes": [
+        "JsonExperienceStore"
+      ],
+      "imports": [
+        "__future__",
+        "contracts",
+        "json",
+        "pathlib"
+      ],
+      "function_count": 6,
+      "class_count": 1
+    },
+    {
+      "path": "scripts/feedback/feedback_adapter.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "_sync_runtime_tuning",
+        "adapt"
+      ],
+      "classes": [
+        "FindFeedbackAdapter"
+      ],
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "contracts",
+        "copy",
+        "datetime",
+        "pathlib",
+        "sys",
+        "uuid"
+      ],
+      "function_count": 2,
+      "class_count": 1
+    },
+    {
+      "path": "scripts/feedback/interfaces.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "search_cases",
+        "search_recovery_cases",
+        "adapt",
+        "execute",
+        "observe",
+        "validate",
+        "build",
+        "decide",
+        "resolve",
+        "propose"
+      ],
+      "classes": [
+        "ExperienceStore",
+        "RecoveryExperienceStore",
+        "FeedbackAdapter",
+        "Executor",
+        "Observer",
+        "ResultValidator",
+        "AnomalyBuilder",
+        "RecoveryController",
+        "RecoveryApprovalGate",
+        "RecoveryAdvisor"
+      ],
+      "imports": [
+        "__future__",
+        "contracts",
+        "typing"
+      ],
+      "function_count": 10,
+      "class_count": 10
+    },
+    {
+      "path": "scripts/feedback/observer.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "_utc_now",
+        "_required_for",
+        "_select_path",
+        "_artifact",
+        "_read_json_object",
+        "_read_tail",
+        "_parse_datetime",
+        "_optional_non_negative_int",
+        "_parse_counts",
+        "_parse_source_status",
+        "_collect_signals",
+        "_meaningful_progress_changed",
+        "_status_for",
+        "observe"
+      ],
+      "classes": [
+        "FileProgressObserver"
+      ],
+      "imports": [
+        "__future__",
+        "contracts",
+        "datetime",
+        "json",
+        "pathlib",
+        "re",
+        "uuid"
+      ],
+      "function_count": 14,
+      "class_count": 1
+    },
+    {
+      "path": "scripts/feedback/query_builder.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "build_experience_query",
+        "build_recovery_experience_query"
+      ],
+      "classes": [],
+      "imports": [
+        "__future__",
+        "contracts"
+      ],
+      "function_count": 2,
+      "class_count": 0
+    },
+    {
+      "path": "scripts/feedback/request_builder.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "build_find_stage_request"
+      ],
+      "classes": [],
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "contracts"
+      ],
+      "function_count": 1,
+      "class_count": 0
+    },
+    {
+      "path": "scripts/feedback/state_machine.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "_rule",
+        "_build_transition_rules",
+        "resolve_transition",
+        "_event_type",
+        "_require_aware_event_time",
+        "advance_state"
+      ],
+      "classes": [
+        "SupervisorCommand",
+        "TransitionRule",
+        "TransitionOutcome"
+      ],
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "contracts",
+        "dataclasses",
+        "datetime",
+        "enum"
+      ],
+      "function_count": 6,
+      "class_count": 3
+    },
+    {
+      "path": "scripts/feedback/supervisor.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "_utc_now",
+        "__init__",
+        "state",
+        "on_monitor_tick",
+        "on_process_exited",
+        "_validate_common_inputs",
+        "_build_anomaly",
+        "_matching_snapshot",
+        "_anomaly_key"
+      ],
+      "classes": [
+        "FeedbackSupervisor"
+      ],
+      "imports": [
+        "__future__",
+        "contracts",
+        "copy",
+        "dataclasses",
+        "datetime",
+        "interfaces"
+      ],
+      "function_count": 9,
+      "class_count": 1
+    },
+    {
+      "path": "scripts/feedback/validator.py",
+      "category": "feedback",
+      "kind": "python",
+      "functions": [
+        "_utc_now",
+        "_check",
+        "_path_exists",
+        "_select_result_path",
+        "_missing_artifact",
+        "_read_result",
+        "_number",
+        "_fallback_rank_key",
+        "_ranking_rows",
+        "_candidate_identity",
+        "_candidate_ids",
+        "_candidate_digest",
+        "_non_negative_int",
+        "_recommendation_statistics",
+        "validate"
+      ],
+      "classes": [
+        "FindResultValidator"
+      ],
+      "imports": [
+        "__future__",
+        "contracts",
+        "datetime",
+        "hashlib",
+        "json",
+        "pathlib",
+        "re",
+        "stat",
+        "time",
+        "uuid"
+      ],
+      "function_count": 15,
+      "class_count": 1
+    },
+    {
       "path": "scripts/integrations/__init__.py",
       "category": "integrations",
       "kind": "python",
@@ -1379,6 +1905,21 @@
       "category": "orchestration",
       "kind": "python",
       "functions": [
+        "_start_find_with_executor",
+        "_read_execution_log_chunk",
+        "_posix_process_table",
+        "_find_process_tree_pids",
+        "_driver_process_group_pids",
+        "_owned_find_process_pids",
+        "_live_posix_pids",
+        "_wait_for_posix_pids_to_exit",
+        "_signal_posix_pids",
+        "_stop_find_process",
+        "_register_find_process_exit_cleanup",
+        "_consume_execution_logs",
+        "_extract_json_tail",
+        "_parse_find_cli_result",
+        "_terminate_driver_process_group",
         "_local_llm_config_path",
         "_load_local_llm_config",
         "driver_python_command",
@@ -1397,13 +1938,21 @@
         "save_taste_reuse_signature",
         "latest_taste_run_hint",
         "write_find_timeout_state",
-        "main"
+        "main",
+        "__init__",
+        "consume",
+        "_consume_line"
       ],
-      "classes": [],
+      "classes": [
+        "_FindRunBindingParser"
+      ],
       "imports": [
         "__future__",
         "argparse",
+        "atexit",
+        "codecs",
         "datetime",
+        "feedback",
         "hashlib",
         "json",
         "os",
@@ -1416,10 +1965,11 @@
         "signal",
         "subprocess",
         "sys",
-        "time"
+        "time",
+        "typing"
       ],
-      "function_count": 19,
-      "class_count": 0
+      "function_count": 37,
+      "class_count": 1
     },
     {
       "path": "scripts/orchestration/run_full_research_cycle.py",

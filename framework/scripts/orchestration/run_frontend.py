@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import codecs
 import datetime as dt
 import hashlib
 import json
@@ -13,6 +15,7 @@ import subprocess
 import time
 import sys
 from pathlib import Path
+from typing import Callable
 
 from project.project_paths import ROOT, build_paths, conda_executable, management_python
 
@@ -20,10 +23,408 @@ from runtime.taste_pythonpath import ensure_taste_pythonpath
 ensure_taste_pythonpath(ROOT)
 from policies.source_selection import canonical_source_selection, normalize_source_selection
 from project.project_paths import build_paths as _build_project_paths
+from feedback import ExecutionHandle, RunContext, SubprocessFindExecutor
 
 DEFAULT_ENV = os.environ.get("FIND_ENV_NAME") or os.environ.get("CONDA_ENV_NAME", "")
 DEFAULT_CORE_VENUE_IDS = ["openreview_iclr_2026", "openreview_neurips", "dblp_icml", "dblp_kdd"]
 DEFAULT_LOCAL_LLM_CONFIG_PATH = ROOT / "modules" / "finding" / "config" / "llm.local.json"
+_FIND_LOG_CHUNK_SIZE = 64 * 1024
+_FIND_LOG_POLL_INTERVAL_SECONDS = 0.05
+_FIND_MONITOR_INTERVAL_SECONDS = 1.0
+_FIND_TERMINATE_GRACE_SECONDS = 10
+_FIND_TERMINATE_POLL_INTERVAL_SECONDS = 0.05
+_FIND_DRIVER_PROCESS_GROUP_ENV = "TASTE_FIND_DRIVER_PROCESS_GROUP"
+_FIND_RUN_EVENT_PREFIX = "TASTE_FIND_EVENT "
+_FIND_RUN_EVENT_BUFFER_LIMIT = 64 * 1024
+
+
+class _FindRunBindingParser:
+    """Bind one ExecutionHandle from complete structured Find log lines."""
+
+    def __init__(self, runs_dir: Path) -> None:
+        self._runs_dir = Path(runs_dir).expanduser().resolve()
+        self._buffer = ""
+
+    def consume(self, text: str, *, execution_handle: ExecutionHandle) -> bool:
+        """Consume one text chunk and report whether a candidate was rejected."""
+        rejected = False
+        combined = self._buffer + text
+        self._buffer = ""
+        for segment in combined.splitlines(keepends=True):
+            if segment.endswith(("\n", "\r")):
+                rejected = self._consume_line(
+                    segment.rstrip("\r\n"),
+                    execution_handle,
+                ) or rejected
+            else:
+                self._buffer = segment
+        if len(self._buffer) > _FIND_RUN_EVENT_BUFFER_LIMIT:
+            rejected = self._buffer.startswith(_FIND_RUN_EVENT_PREFIX) or rejected
+            self._buffer = ""
+        return rejected
+
+    def _consume_line(
+        self,
+        line: str,
+        execution_handle: ExecutionHandle,
+    ) -> bool:
+        if not line.startswith(_FIND_RUN_EVENT_PREFIX):
+            return False
+        try:
+            payload = json.loads(line.removeprefix(_FIND_RUN_EVENT_PREFIX))
+        except (TypeError, json.JSONDecodeError):
+            return True
+        if not isinstance(payload, dict) or payload.get("event") != "find_run_created":
+            return True
+        run_id = payload.get("run_id")
+        run_dir_value = payload.get("run_dir")
+        if (
+            not isinstance(run_id, str)
+            or not run_id.strip()
+            or not isinstance(run_dir_value, str)
+            or not run_dir_value.strip()
+        ):
+            return True
+        run_dir = Path(run_dir_value).expanduser()
+        if not run_dir.is_absolute():
+            return True
+        try:
+            resolved_run_dir = run_dir.resolve(strict=True)
+        except OSError:
+            return True
+        if (
+            not resolved_run_dir.is_dir()
+            or resolved_run_dir.name != run_id
+            or not resolved_run_dir.is_relative_to(self._runs_dir)
+        ):
+            return True
+        bound_identity = (execution_handle.run_id, execution_handle.run_dir)
+        candidate_identity = (run_id, str(resolved_run_dir))
+        if bound_identity == (None, None):
+            execution_handle.run_id, execution_handle.run_dir = candidate_identity
+            return False
+        if bound_identity == candidate_identity:
+            return False
+        return True
+
+
+def _start_find_with_executor(
+    run_context: RunContext,
+) -> tuple[SubprocessFindExecutor, ExecutionHandle, subprocess.Popen[bytes]]:
+    """Start the one Find child that the generated driver will supervise."""
+    executor = SubprocessFindExecutor()
+    execution_handle = executor.execute(run_context)
+    process = executor.get_process(execution_handle)
+    return executor, execution_handle, process
+
+
+def _read_execution_log_chunk(
+    stream: object,
+    decoder: codecs.IncrementalDecoder,
+    emit: Callable[[str], None],
+    captured: list[str] | None,
+    *,
+    final: bool = False,
+) -> bool:
+    """Forward one bounded log chunk and optionally retain stdout for JSON."""
+    data = stream.read(_FIND_LOG_CHUNK_SIZE)  # type: ignore[attr-defined]
+    if not data:
+        if final:
+            text = decoder.decode(b"", final=True)
+            if text:
+                emit(text)
+                if captured is not None:
+                    captured.append(text)
+        return False
+    text = decoder.decode(data, final=False)
+    if text:
+        emit(text)
+        if captured is not None:
+            captured.append(text)
+    return True
+
+
+def _posix_process_table() -> dict[int, tuple[int, int, str]]:
+    """Return PID, parent PID, process group, and state from Linux procfs."""
+    if os.name != "posix":
+        return {}
+    processes: dict[int, tuple[int, int, str]] = {}
+    try:
+        proc_entries = Path("/proc").iterdir()
+    except OSError:
+        return processes
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw_stat = (entry / "stat").read_text(encoding="utf-8")
+            _, fields_text = raw_stat.rsplit(") ", 1)
+            fields = fields_text.split()
+            if len(fields) < 3:
+                continue
+            processes[int(entry.name)] = (int(fields[1]), int(fields[2]), fields[0])
+        except (OSError, ValueError):
+            continue
+    return processes
+
+
+def _find_process_tree_pids(root_pid: int) -> set[int]:
+    """Collect only descendants of the Find PID known to this driver."""
+    processes = _posix_process_table()
+    owned = {root_pid}
+    pending = [root_pid]
+    while pending:
+        parent_pid = pending.pop()
+        for pid, (candidate_parent_pid, _, _) in processes.items():
+            if candidate_parent_pid == parent_pid and pid not in owned:
+                owned.add(pid)
+                pending.append(pid)
+    return owned
+
+
+def _driver_process_group_pids() -> set[int]:
+    """Return other members only when this process owns a dedicated session."""
+    if os.name != "posix":
+        return set()
+    if os.environ.get(_FIND_DRIVER_PROCESS_GROUP_ENV) != "1":
+        return set()
+    driver_pid = os.getpid()
+    try:
+        if os.getpgrp() != driver_pid or os.getsid(driver_pid) != driver_pid:
+            return set()
+    except OSError:
+        return set()
+    return {
+        pid
+        for pid, (_, process_group, state) in _posix_process_table().items()
+        if process_group == driver_pid and state != "Z" and pid != driver_pid
+    }
+
+
+def _owned_find_process_pids(process: subprocess.Popen[bytes]) -> set[int]:
+    """Resolve the direct Find child plus only processes owned by this driver."""
+    owned = _driver_process_group_pids()
+    if process.poll() is None:
+        owned.update(_find_process_tree_pids(process.pid))
+    owned.discard(os.getpid())
+    return {pid for pid in owned if pid > 0}
+
+
+def _live_posix_pids(process_ids: set[int]) -> set[int]:
+    """Treat vanished and zombie processes as no longer running."""
+    processes = _posix_process_table()
+    return {
+        pid
+        for pid in process_ids
+        if pid in processes and processes[pid][2] != "Z"
+    }
+
+
+def _wait_for_posix_pids_to_exit(process_ids: set[int], timeout: float) -> set[int]:
+    """Wait a bounded interval for the explicitly owned processes to exit."""
+    deadline = time.monotonic() + timeout
+    remaining = _live_posix_pids(process_ids)
+    while remaining and time.monotonic() < deadline:
+        time.sleep(_FIND_TERMINATE_POLL_INTERVAL_SECONDS)
+        remaining = _live_posix_pids(remaining)
+    return remaining
+
+
+def _signal_posix_pids(process_ids: set[int], signal_number: int) -> None:
+    """Signal exact, already-owned PIDs without process-name matching."""
+    for pid in process_ids:
+        try:
+            os.kill(pid, signal_number)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+
+def _stop_find_process(process: subprocess.Popen[bytes]) -> int | None:
+    """Stop the direct Find child and only its driver-owned descendants."""
+    if os.name != "posix":
+        try:
+            return_code = process.poll()
+            if return_code is not None:
+                return process.wait()
+            process.terminate()
+            try:
+                return process.wait(timeout=_FIND_TERMINATE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return process.wait()
+        except Exception:
+            return process.poll()
+
+    try:
+        process_ids = _owned_find_process_pids(process)
+        _signal_posix_pids(process_ids, signal.SIGTERM)
+        remaining = _wait_for_posix_pids_to_exit(
+            process_ids,
+            _FIND_TERMINATE_GRACE_SECONDS,
+        )
+        if remaining:
+            _signal_posix_pids(remaining, signal.SIGKILL)
+            _wait_for_posix_pids_to_exit(
+                remaining,
+                _FIND_TERMINATE_GRACE_SECONDS,
+            )
+        try:
+            return process.wait(timeout=_FIND_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return process.wait()
+    except Exception:
+        return process.poll()
+
+
+def _register_find_process_exit_cleanup(process: subprocess.Popen[bytes]) -> None:
+    """Ensure an unhandled generated-driver failure cannot orphan this Find tree."""
+    atexit.register(_stop_find_process, process)
+
+
+def _consume_execution_logs(
+    process: subprocess.Popen[bytes],
+    execution_handle: ExecutionHandle,
+    emit: Callable[[str], None],
+    *,
+    poll_interval: float = _FIND_LOG_POLL_INTERVAL_SECONDS,
+    on_monitor_tick: Callable[[ExecutionHandle], None] | None = None,
+) -> str:
+    """Forward split Find logs, wait for completion, and retain stdout only."""
+    stdout_parts: list[str] = []
+    stdout_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    stderr_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    next_monitor_tick = time.monotonic()
+    try:
+        with Path(execution_handle.stdout_path).open("rb") as stdout_stream, Path(
+            execution_handle.stderr_path
+        ).open("rb") as stderr_stream:
+            while True:
+                _read_execution_log_chunk(
+                    stdout_stream,
+                    stdout_decoder,
+                    emit,
+                    stdout_parts,
+                )
+                _read_execution_log_chunk(
+                    stderr_stream,
+                    stderr_decoder,
+                    emit,
+                    None,
+                )
+                if process.poll() is not None:
+                    exit_code = process.wait()
+                    if exit_code != 0:
+                        _stop_find_process(process)
+                    while _read_execution_log_chunk(
+                        stdout_stream,
+                        stdout_decoder,
+                        emit,
+                        stdout_parts,
+                    ):
+                        pass
+                    while _read_execution_log_chunk(
+                        stderr_stream,
+                        stderr_decoder,
+                        emit,
+                        None,
+                    ):
+                        pass
+                    _read_execution_log_chunk(
+                        stdout_stream,
+                        stdout_decoder,
+                        emit,
+                        stdout_parts,
+                        final=True,
+                    )
+                    _read_execution_log_chunk(
+                        stderr_stream,
+                        stderr_decoder,
+                        emit,
+                        None,
+                        final=True,
+                    )
+                    execution_handle.process_alive = False
+                    execution_handle.exit_code = exit_code
+                    return "".join(stdout_parts)
+                if (
+                    on_monitor_tick is not None
+                    and time.monotonic() >= next_monitor_tick
+                ):
+                    try:
+                        on_monitor_tick(execution_handle)
+                    except Exception as error:
+                        emit(
+                            "[framework] Feedback monitor callback failed: "
+                            + type(error).__name__
+                            + "\n"
+                        )
+                    next_monitor_tick = time.monotonic() + _FIND_MONITOR_INTERVAL_SECONDS
+                time.sleep(poll_interval)
+    except BaseException:
+        exit_code = _stop_find_process(process)
+        if exit_code is not None:
+            execution_handle.process_alive = False
+            execution_handle.exit_code = exit_code
+        raise
+
+
+def _extract_json_tail(text: str) -> dict[str, object]:
+    for index in range(len(text) - 1, -1, -1):
+        if text[index] != "{":
+            continue
+        candidate = text[index:].strip()
+        try:
+            payload = json.loads(candidate)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _parse_find_cli_result(
+    stdout_output: str,
+    finding_module: Path,
+) -> tuple[str, Path, dict[str, object]]:
+    """Resolve only this Find invocation's result from its stdout payload."""
+    cli_payload = _extract_json_tail(stdout_output)
+    run_id = str(cli_payload.get("run_id") or "")
+    run_dir_text = str(cli_payload.get("run_dir") or "")
+    if not run_id or not run_dir_text:
+        raise RuntimeError("Finding CLI did not return run_id/run_dir")
+    directory = Path(run_dir_text)
+    if not directory.is_absolute():
+        directory = finding_module / directory
+    result_path = directory / "find_results.json"
+    if not result_path.exists():
+        raise RuntimeError("Finding CLI completed but find_results.json is missing: " + str(directory))
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Finding CLI produced an unreadable find_results.json: " + str(directory)) from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("Finding CLI produced a non-object find_results.json: " + str(directory))
+    return run_id, directory, result
+
+
+def _terminate_driver_process_group(proc: subprocess.Popen[str]) -> None:
+    """Stop the outer driver group, which includes its inherited Find child."""
+    if proc.poll() is not None:
+        proc.wait()
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except Exception:
+        proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        proc.wait()
 
 
 def _local_llm_config_path() -> Path:
@@ -47,10 +448,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
-import subprocess
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 root = Path({root_json})
@@ -61,9 +460,29 @@ from runtime.taste_pythonpath import ensure_taste_pythonpath
 ensure_taste_pythonpath(root)
 os.environ["WORKFLOW_RUNTIME_DIR"] = os.environ.get("FINDING_RUNTIME_DIR") or str(root / "modules" / "finding" / ".runtime")
 
+from orchestration.run_frontend import (
+    _FindRunBindingParser,
+    _consume_execution_logs,
+    _parse_find_cli_result,
+    _register_find_process_exit_cleanup,
+    _start_find_with_executor,
+)
 from project.project_paths import build_paths, load_project_config
 from bridges.reading_bridge import update_project_read_default_after_find
 from bridges.sync_outputs import adopt_taste_find_run
+from feedback import (
+    FeedbackSupervisor,
+    FindFeedbackAdapter,
+    FindAnomalyBuilder,
+    FindRecoveryController,
+    FindResultValidator,
+    FileProgressObserver,
+    JsonExperienceStore,
+    SupervisorState,
+    SupervisorStatus,
+    build_experience_query,
+    build_find_stage_request,
+)
 
 DEFAULT_CORE_VENUE_IDS = {core_venue_ids_json}
 project = {project_json}
@@ -76,6 +495,11 @@ include_github = {include_github}
 use_venues = {use_venues}
 source_selection = {source_selection_json}
 api_mode = {api_mode_json}
+request_source = {request_source_json}
+force_new_find = {force_new_find}
+restart_full_cycle = {restart_full_cycle}
+human_approved_new_find = {human_approved_new_find}
+approval_reason = {approval_reason_json}
 paths = build_paths(project)
 internal_output_dir_raw = os.environ.get("TASTE_INTERNAL_FIND_OUTPUT_DIR", "").strip()
 internal_output_dir = Path(internal_output_dir_raw).expanduser() if internal_output_dir_raw else None
@@ -384,65 +808,158 @@ find_config_payload = {{
     for key, value in config_payload.items()
     if key not in find_input_fields and key not in find_llm_fields and key not in {{"default_find_selection", "email"}}
 }}
-combined_find_config = {{
-    "schema_version": 1,
-    "config": find_config_payload,
-    "selection": selection_payload,
-}}
-write_json_file(project_find_config_path, combined_find_config)
-
 find_config_path = input_dir / "find.config.json"
 input_path = input_dir / "input.json"
 config_path = input_dir / "config.json"
 selection_path = input_dir / "selection.json"
-write_json_file(find_config_path, combined_find_config)
 write_json_file(input_path, input_payload)
 config_path.write_text(json.dumps(config_payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 selection_path.write_text(json.dumps(selection_payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
-def _extract_json_tail(text):
-    for index in range(len(text) - 1, -1, -1):
-        if text[index] != "{{":
-            continue
-        candidate = text[index:].strip()
-        try:
-            return json.loads(candidate)
-        except Exception:
-            continue
-    return {{}}
+find_stage_request = build_find_stage_request(
+    request_source=request_source,
+    project_id=project or None,
+    research_topic=configured_topic,
+    selection=selection_payload,
+    config_path=str(find_config_path),
+    requested_parameters=find_config_payload,
+    working_directory=str(root),
+    force_new_find=force_new_find,
+    restart_full_cycle=restart_full_cycle,
+    human_approved_new_find=human_approved_new_find,
+    approval_reason=approval_reason or None,
+)
+experience_query = build_experience_query(
+    find_stage_request,
+    required_context_tags=[],
+    limit=5,
+)
+experience_store = JsonExperienceStore(
+    root / ".runtime" / "feedback" / "experience_cases.json"
+)
+matched_experiences = experience_store.search_cases(experience_query)
+run_context = FindFeedbackAdapter().adapt(
+    find_stage_request,
+    experience_query,
+    matched_experiences,
+)
+runtime_find_config = {{
+    "schema_version": 1,
+    "config": dict(run_context.effective_parameters),
+    "selection": selection_payload,
+}}
+write_json_file(find_config_path, runtime_find_config)
 
-find_cmd = [
-    sys.executable,
-    str(finding_entrypoint),
-    "--action",
-    "find",
-    "--config-json",
-    str(find_config_path),
-    "--input-json",
-    str(input_path),
-]
+supervisor_now = datetime.now(timezone.utc)
+initial_supervisor_state = SupervisorState(
+    supervisor_id="supervisor-" + run_context.context_id,
+    project_id=run_context.project_id,
+    root_run_id=None,
+    status=SupervisorStatus.PREPARING,
+    state_revision=0,
+    created_at=supervisor_now,
+    updated_at=supervisor_now,
+    heartbeat_at=supervisor_now,
+    producer="framework-find-driver",
+    producer_version="v0",
+    process_alive=False,
+    cancel_requested=False,
+    recovery_attempts=0,
+    recovery_budget_total=run_context.recovery_budget,
+    recovery_budget_remaining=run_context.recovery_budget,
+    awaiting_approval=False,
+    gate_evaluated=False,
+    allow_read=False,
+    gate_reason="Preparing Find supervision",
+    terminal=False,
+    event_sequence=0,
+    state_path=str(input_dir / "feedback-supervisor-state.json"),
+    run_context_id=run_context.context_id,
+)
+supervisor = FeedbackSupervisor(
+    observer=FileProgressObserver(),
+    result_validator=FindResultValidator(),
+    anomaly_builder=FindAnomalyBuilder(),
+    recovery_controller=FindRecoveryController(
+        experience_store=experience_store,
+        recovery_advisor=None,
+    ),
+    initial_state=initial_supervisor_state,
+)
+feedback_decisions = []
+
+def _on_feedback_monitor_tick(handle):
+    decision = supervisor.on_monitor_tick(
+        run_context=run_context,
+        execution_handle=handle,
+    )
+    if decision is not None:
+        feedback_decisions.append(decision)
+
+find_runtime_dir = Path(
+    os.environ.get("FINDING_RUNTIME_DIR") or finding_module / ".runtime"
+).expanduser()
+binding_parser = _FindRunBindingParser(find_runtime_dir / "runs")
+
+def _emit_find_log(text):
+    try:
+        binding_rejected = binding_parser.consume(
+            text,
+            execution_handle=execution_handle,
+        )
+    except Exception:
+        binding_rejected = True
+    if binding_rejected:
+        print("[framework] Find run binding event rejected", flush=True)
+    print(text, end="", flush=True)
+
 print("[framework] Finding public CLI input: " + str(find_config_path) + " / " + str(input_path), flush=True)
-proc = subprocess.Popen(find_cmd, cwd=str(root), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
-find_output = []
-assert proc.stdout is not None
-for line in proc.stdout:
-    find_output.append(line)
-    print(line, end="", flush=True)
-returncode = proc.wait()
-combined_output = "".join(find_output)
+executor, execution_handle, process = _start_find_with_executor(run_context)
+_register_find_process_exit_cleanup(process)
+stdout_output = _consume_execution_logs(
+    process,
+    execution_handle,
+    _emit_find_log,
+    on_monitor_tick=_on_feedback_monitor_tick,
+)
+returncode = execution_handle.exit_code
+terminal_feedback_called = False
+
+def _notify_feedback_process_exited():
+    try:
+        decision = supervisor.on_process_exited(
+            run_context=run_context,
+            execution_handle=execution_handle,
+        )
+    except RuntimeError:
+        decision = None
+        print("[framework] Feedback Supervisor terminal call failed", flush=True)
+    if decision is not None:
+        feedback_decisions.append(decision)
+
+if execution_handle.run_id and execution_handle.run_dir:
+    _notify_feedback_process_exited()
+    terminal_feedback_called = True
+
 if returncode != 0:
+    if not terminal_feedback_called:
+        print("[framework] Find exited before run identity was bound", flush=True)
     raise SystemExit(returncode)
-cli_payload = _extract_json_tail(combined_output)
-run_id = str(cli_payload.get("run_id") or "")
-run_dir_text = str(cli_payload.get("run_dir") or "")
-if not run_id or not run_dir_text:
-    raise RuntimeError("Finding CLI did not return run_id/run_dir")
-directory = Path(run_dir_text)
-if not directory.is_absolute():
-    directory = finding_module / directory
-if not (directory / "find_results.json").exists():
-    raise RuntimeError("Finding CLI completed but find_results.json is missing: " + str(directory))
-result = json.loads((directory / "find_results.json").read_text(encoding="utf-8"))
+
+run_id, directory, result = _parse_find_cli_result(stdout_output, finding_module)
+if execution_handle.run_id and execution_handle.run_dir:
+    if (
+        execution_handle.run_id != run_id
+        or Path(execution_handle.run_dir).resolve() != directory.resolve()
+    ):
+        raise RuntimeError("Finding CLI run identity conflicts with the bound Find run")
+else:
+    execution_handle.run_id = run_id
+    execution_handle.run_dir = str(directory)
+
+if not terminal_feedback_called:
+    _notify_feedback_process_exited()
+    terminal_feedback_called = True
 out_dir = internal_output_dir if internal_output_dir is not None else paths.planning / "finding"
 out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -728,7 +1245,9 @@ def driver_python_command(args: argparse.Namespace, cfg: dict, driver: Path) -> 
 
 
 def run(cmd: list[str], cwd: Path = ROOT, env: dict[str, str] | None = None, timeout_sec: int = 900, live_log_path: Path | None = None) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.Popen(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True, bufsize=1)
+    driver_env = dict(os.environ if env is None else env)
+    driver_env[_FIND_DRIVER_PROCESS_GROUP_ENV] = "1"
+    proc = subprocess.Popen(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=driver_env, start_new_session=True, bufsize=1)
     started = time.monotonic()
     lines: list[str] = []
     last_heartbeat = 0.0
@@ -768,21 +1287,13 @@ def run(cmd: list[str], cwd: Path = ROOT, env: dict[str, str] | None = None, tim
                 last_heartbeat = time.monotonic()
             time.sleep(0.2)
     except subprocess.TimeoutExpired as exc:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except Exception:
-            proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except Exception:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
-                proc.kill()
-            proc.wait()
+        _terminate_driver_process_group(proc)
         exc.output = "".join(lines)
         exc.stderr = ""
         raise exc
+    except BaseException:
+        _terminate_driver_process_group(proc)
+        raise
 
 
 def read_focus_queries(path: str) -> list[str]:
@@ -854,7 +1365,7 @@ def merge_extra_queries(args: argparse.Namespace) -> list[str]:
     return merged
 
 
-def write_driver(path: Path, project: str, max_papers: int, max_ideas: int, repair_rounds: int, include_arxiv: bool, include_huggingface: bool, include_github: bool, use_venues: bool, source_selection: dict[str, Any], *, deep_survey: bool = False, fast_mode: bool = False) -> None:
+def write_driver(path: Path, project: str, max_papers: int, max_ideas: int, repair_rounds: int, include_arxiv: bool, include_huggingface: bool, include_github: bool, use_venues: bool, source_selection: dict[str, Any], *, request_source: str = "cli", force_new_find: bool = False, restart_full_cycle: bool = False, human_approved_new_find: bool = False, approval_reason: str = "", deep_survey: bool = False, fast_mode: bool = False) -> None:
     code = DRIVER_TEMPLATE.format(
         root_json=json.dumps(str(ROOT)),
         taste_root_json=json.dumps(str(ROOT)),
@@ -868,6 +1379,11 @@ def write_driver(path: Path, project: str, max_papers: int, max_ideas: int, repa
         use_venues=use_venues,
         source_selection_json=repr(source_selection),
         api_mode_json=json.dumps(os.environ.get("LLM_API_MODE", "chat_completions")),
+        request_source_json=json.dumps(request_source),
+        force_new_find=bool(force_new_find),
+        restart_full_cycle=bool(restart_full_cycle),
+        human_approved_new_find=bool(human_approved_new_find),
+        approval_reason_json=json.dumps(approval_reason),
         core_venue_ids_json=json.dumps(DEFAULT_CORE_VENUE_IDS),
         deep_survey=bool(deep_survey),
         fast_mode=bool(fast_mode),
@@ -1144,6 +1660,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run the configured Find route and sync real Find artifacts into the project.")
     parser.add_argument("--project", required=True)
     parser.add_argument("--web-job-id", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--request-source", choices=["web", "cli", "full_cycle"], default="", help=argparse.SUPPRESS)
+    parser.add_argument("--force-new-find", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--restart-full-cycle", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--human-approved-new-find", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--approval-reason", default="", help=argparse.SUPPRESS)
     parser.add_argument("--env-name", default=DEFAULT_ENV)
     parser.add_argument("--max-papers", type=int, default=20)
     parser.add_argument("--max-ideas", type=int, default=6)
@@ -1245,6 +1766,11 @@ def main() -> int:
         bool(source_selection.get("include_github")),
         bool(source_selection.get("venue_ids")),
         source_selection,
+        request_source=args.request_source or ("web" if args.web_job_id else "cli"),
+        force_new_find=bool(args.force_new_find),
+        restart_full_cycle=bool(args.restart_full_cycle),
+        human_approved_new_find=bool(args.human_approved_new_find),
+        approval_reason=str(args.approval_reason or "").strip(),
         deep_survey=bool(args.deep_survey),
         fast_mode=bool(args.fast_mode),
     )

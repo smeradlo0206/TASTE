@@ -1164,7 +1164,14 @@ def main() -> int:
                 print(skip_msg, flush=True)
                 (paths.logs / '05a_finding_frontend.log').write_text(skip_msg + '\n', encoding='utf-8')
             else:
-                taste_cmd = [sys.executable, str(script_dir / 'run_frontend.py'), '--project', args.project]
+                taste_cmd = [
+                    sys.executable,
+                    str(script_dir / 'run_frontend.py'),
+                    '--project',
+                    args.project,
+                    '--request-source',
+                    'full_cycle',
+                ]
                 if args.deep_literature_survey:
                     taste_cmd.append('--deep-survey')
                 else:
