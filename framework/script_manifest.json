@@ -1167,7 +1167,8 @@
         "PlanPolishRequest",
         "VenueHealthRequest",
         "EmailJobRequest",
-        "IdeaPatch"
+        "IdeaPatch",
+        "RecoveryApprovalRequest"
       ],
       "imports": [
         "__future__",
@@ -1177,7 +1178,7 @@
         "typing"
       ],
       "function_count": 0,
-      "class_count": 14
+      "class_count": 15
     },
     {
       "path": "scripts/feedback/__init__.py",

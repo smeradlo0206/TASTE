@@ -288,7 +288,11 @@ class LLMRecoveryAdvisor:
             matched_experiences,
         )
         try:
-            raw_response = self._llm_client.chat(prompt)
+            raw_response = self._llm_client.chat(
+                prompt,
+                omit_max_tokens=True,
+                allow_reasoning_fallback=False,
+            )
         except Exception as exc:
             if _is_client_response_extraction_failure(exc):
                 raise RuntimeError(

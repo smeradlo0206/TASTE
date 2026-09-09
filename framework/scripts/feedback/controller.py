@@ -191,7 +191,6 @@ class FindRecoveryController:
                 reason="Recovery experience lookup failed",
             )
 
-        rejected_reasons: list[str] = []
         for case in matched_experiences:
             rejection = self._experience_rejection_reason(
                 case,
@@ -200,7 +199,23 @@ class FindRecoveryController:
                 supervisor_state,
             )
             if rejection is not None:
-                rejected_reasons.append(rejection)
+                if case.recovery_action is not None:
+                    action_rejection = self._action_rejection_reason(
+                        case.recovery_action,
+                        run_context,
+                        supervisor_state,
+                    )
+                    if action_rejection is not None:
+                        return self._build_decision(
+                            anomaly=anomaly,
+                            run_context=run_context,
+                            supervisor_state=supervisor_state,
+                            action=RecoveryAction.STOP_AND_REPORT,
+                            reason=(
+                                "Matched recovery experience was rejected: "
+                                f"{action_rejection}"
+                            ),
+                        )
                 continue
             return self._decision_from_experience(
                 case,
@@ -209,47 +224,6 @@ class FindRecoveryController:
                 supervisor_state,
             )
 
-        if matched_experiences:
-            return self._build_decision(
-                anomaly=anomaly,
-                run_context=run_context,
-                supervisor_state=supervisor_state,
-                action=RecoveryAction.STOP_AND_REPORT,
-                reason=f"Matched recovery experience was rejected: {rejected_reasons[0]}",
-            )
-
-        if anomaly.retryable_signal and supervisor_state.recovery_attempts == 0:
-            retry_rejection = self._action_rejection_reason(
-                RecoveryAction.RETRY_NEW_RUN,
-                run_context,
-                supervisor_state,
-            )
-            if retry_rejection is None:
-                return self._build_decision(
-                    anomaly=anomaly,
-                    run_context=run_context,
-                    supervisor_state=supervisor_state,
-                    action=RecoveryAction.RETRY_NEW_RUN,
-                    reason="First structured retryable anomaly permits one unchanged retry",
-                    executable=True,
-                    risk_level=RiskLevel.LOW,
-                )
-            return self._build_decision(
-                anomaly=anomaly,
-                run_context=run_context,
-                supervisor_state=supervisor_state,
-                action=RecoveryAction.STOP_AND_REPORT,
-                reason=f"Automatic retry was rejected: {retry_rejection}",
-            )
-
-        if not run_context.external_costs_authorized:
-            return self._build_decision(
-                anomaly=anomaly,
-                run_context=run_context,
-                supervisor_state=supervisor_state,
-                action=RecoveryAction.STOP_AND_REPORT,
-                reason="Recovery advice requiring external cost is not authorized",
-            )
         if self._recovery_advisor is None:
             return self._build_decision(
                 anomaly=anomaly,
@@ -349,8 +323,6 @@ class FindRecoveryController:
             >= _MAX_SAME_ACTION_ATTEMPTS
         ):
             return "the same action attempt limit is reached"
-        if not run_context.external_costs_authorized:
-            return "external network or LLM cost is not authorized"
         return None
 
     @classmethod
@@ -507,6 +479,19 @@ class FindRecoveryController:
 
         parameter_changes = _proposal_parameter_changes(proposal, run_context)
         assert parameter_changes is not None
+        if proposal.risk_level is RiskLevel.LOW:
+            return self._build_decision(
+                anomaly=anomaly,
+                run_context=run_context,
+                supervisor_state=supervisor_state,
+                action=proposal.proposed_action,
+                reason=proposal.reason,
+                risk_level=proposal.risk_level,
+                executable=True,
+                parameter_changes=parameter_changes,
+                target_sources=proposal.target_sources,
+                evidence=proposal.evidence_refs,
+            )
         return self._build_decision(
             anomaly=anomaly,
             run_context=run_context,

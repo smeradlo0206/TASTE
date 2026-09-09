@@ -210,7 +210,11 @@ def _chat_response_debug(raw: Any) -> str:
     return "; ".join(part for part in parts if part)
 
 
-def _extract_chat_text(raw: Any) -> str:
+def _extract_chat_text(
+    raw: Any,
+    *,
+    allow_reasoning_fallback: bool = True,
+) -> str:
     if not isinstance(raw, dict):
         return ""
     choices = raw.get("choices", []) or []
@@ -225,9 +229,10 @@ def _extract_chat_text(raw: Any) -> str:
         # Reasoning-only output usually means the provider spent the token budget before
         # emitting final JSON in message.content. Use reasoning_content only when it
         # visibly contains JSON; otherwise treat it as empty and expose diagnostics.
-        value = _content_to_text(message.get("reasoning_content", choice.get("reasoning_content", "")))
-        if value and ("{" in value or "[" in value):
-            return value
+        if allow_reasoning_fallback:
+            value = _content_to_text(message.get("reasoning_content", choice.get("reasoning_content", "")))
+            if value and ("{" in value or "[" in value):
+                return value
     for item in raw.get("output", []) or []:
         if not isinstance(item, dict):
             continue
@@ -281,7 +286,15 @@ class LLMClient:
             "api_mode": self.api_mode or "chat_completions",
         }
 
-    def chat(self, prompt: str, temperature: float | None = None, max_tokens: int | None = None) -> str:
+    def chat(
+        self,
+        prompt: str,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        *,
+        omit_max_tokens: bool = False,
+        allow_reasoning_fallback: bool = True,
+    ) -> str:
         if not self.enabled:
             raise RuntimeError("LLM is not configured")
 
@@ -311,8 +324,9 @@ class LLMClient:
                         {"role": "user", "content": [{"type": "input_text", "text": request_prompt}]},
                     ],
                     "temperature": self.temperature if temperature is None else temperature,
-                    "max_output_tokens": int(max_tokens or self.max_tokens),
                 }
+                if not omit_max_tokens:
+                    payload["max_output_tokens"] = int(max_tokens or self.max_tokens)
                 if wants_json_response:
                     payload["text"] = {"format": {"type": "json_object"}}
             else:
@@ -323,8 +337,9 @@ class LLMClient:
                         {"role": "user", "content": request_prompt},
                     ],
                     "temperature": self.temperature if temperature is None else temperature,
-                    "max_tokens": int(max_tokens or self.max_tokens),
                 }
+                if not omit_max_tokens:
+                    payload["max_tokens"] = int(max_tokens or self.max_tokens)
                 if wants_json_response:
                     payload["response_format"] = {"type": "json_object"}
             if not disable_thinking and reasoning_effort and reasoning_effort not in {"none", "off", "disable", "disabled", "0", "false", "no"}:
@@ -352,7 +367,10 @@ class LLMClient:
                 try:
                     with urllib.request.urlopen(req, timeout=self.timeout_sec) as response:
                         raw = json.loads(response.read().decode("utf-8", "ignore"))
-                    text = _extract_chat_text(raw)
+                    text = _extract_chat_text(
+                        raw,
+                        allow_reasoning_fallback=allow_reasoning_fallback,
+                    )
                     if text:
                         return text
                     raise RuntimeError("Chat Completions API returned no extractable text; " + _chat_response_debug(raw))

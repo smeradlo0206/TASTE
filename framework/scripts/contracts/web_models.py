@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from policies.source_selection import default_source_selection
 
@@ -103,6 +103,34 @@ class FindRequest(BaseModel):
     restart_full_cycle: bool = False
     human_approved_new_find: bool = False
     approval_reason: str = ""
+
+
+class RecoveryApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+    )
+    approved: bool = Field(strict=True)
+    approved_by: str = Field(default="", max_length=256)
+    reason: str = Field(default="", max_length=2_000)
+
+    @field_validator("approved_by", "reason")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _validate_approval_metadata(self) -> "RecoveryApprovalRequest":
+        if not self.reason:
+            raise ValueError("reason must be non-empty")
+        if self.approved and not self.approved_by:
+            raise ValueError("approved_by must be non-empty when approved is true")
+        if not self.approved and self.approved_by:
+            raise ValueError("approved_by must be empty when approved is false")
+        return self
 
 
 class ReadRequest(BaseModel):

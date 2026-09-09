@@ -1508,16 +1508,243 @@ def test_web_find_mock_request_does_not_overwrite_local_llm_config(monkeypatch, 
 
 def test_run_frontend_finding_input_snapshot_omits_api_key():
     text = (ROOT / "framework" / "scripts" / "orchestration" / "run_frontend.py").read_text(encoding="utf-8")
+    config_start = text.index("config_payload = {{")
+    config_end = text.index("selection_payload = dict(source_selection)")
+    config_payload_source = text[config_start:config_end]
 
-    assert '"api_key": "",' in text
-    assert '"api_key": api_key' not in text
+    assert '"api_key": "",' in config_payload_source
+    assert '"api_key": api_key' not in config_payload_source
+
+
+def _recovery_pending_payload(decision_id: str = "decision-recovery-web-001") -> dict[str, object]:
+    return {
+        "decision_id": decision_id,
+        "run_id": "find-recovery-web-001",
+        "anomaly_id": "anomaly-recovery-web-001",
+        "proposed_action": "retry_new_run",
+        "risk_level": "medium",
+        "reason": "A bounded synthetic recovery requires approval",
+        "parameter_changes": [],
+        "target_sources": [],
+        "approval_status": "pending",
+    }
+
+
+def _prepare_recovery_approval_job(monkeypatch, tmp_path: Path, *, project: str = "demo"):
+    from auto_research.web import server as web_server
+
+    projects_root = tmp_path / "projects"
+    project_root = projects_root / project
+    project_root.mkdir(parents=True)
+    job = web_server.JobState("find_recovery_web", "find")
+    job.status = "running"
+    job.result = {"project": project}
+    monkeypatch.setattr(web_server, "PROJECT_IDS_ROOT", projects_root)
+    monkeypatch.setattr(web_server, "JOBS", {job.job_id: job})
+    monkeypatch.setattr(web_server, "_persist_jobs", lambda: None)
+    control_dir = project_root / "tmp" / "feedback_recovery" / job.job_id
+    control_dir.mkdir(parents=True)
+    return web_server, job, project_root, control_dir
+
+
+def test_recovery_approval_request_is_strict_and_minimal() -> None:
+    from pydantic import ValidationError
+    from contracts.web_models import RecoveryApprovalRequest
+
+    approved = RecoveryApprovalRequest(
+        decision_id="decision-recovery-web-001",
+        approved=True,
+        approved_by="reviewer-001",
+        reason="Approve one bounded retry",
+    )
+    rejected = RecoveryApprovalRequest(
+        decision_id="decision-recovery-web-001",
+        approved=False,
+        reason="Do not retry this run",
+    )
+
+    assert approved.approved is True
+    assert rejected.approved is False
+    for payload in (
+        {"decision_id": "", "approved": False, "reason": "Reject"},
+        {"decision_id": "../other", "approved": False, "reason": "Reject"},
+        {"decision_id": "decision-1", "approved": 1, "reason": "Reject"},
+        {"decision_id": "decision-1", "approved": True, "reason": "Approve"},
+        {"decision_id": "decision-1", "approved": False, "reason": ""},
+        {
+            "decision_id": "decision-1",
+            "approved": False,
+            "reason": "Reject",
+            "action": "retry_new_run",
+        },
+    ):
+        with pytest.raises(ValidationError):
+            RecoveryApprovalRequest(**payload)
+
+
+def test_recovery_approval_api_reads_and_resolves_only_its_job(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    web_server, job, _project_root, control_dir = _prepare_recovery_approval_job(
+        monkeypatch,
+        tmp_path,
+    )
+    pending = _recovery_pending_payload()
+    web_server.write_json(control_dir / "pending.json", pending)
+
+    current = web_server.api_get_recovery_approval(job.job_id)
+    assert current == {
+        "status": "pending",
+        "job_id": job.job_id,
+        "pending": pending,
+    }
+
+    request = web_server.RecoveryApprovalRequest(
+        decision_id=str(pending["decision_id"]),
+        approved=True,
+        approved_by="reviewer-001",
+        reason="Approve one bounded retry",
+    )
+    response = web_server.api_resolve_recovery_approval(job.job_id, request)
+    resolution = json.loads((control_dir / "resolution.json").read_text(encoding="utf-8"))
+
+    assert response["status"] == "submitted"
+    assert resolution["decision_id"] == pending["decision_id"]
+    assert resolution["approved"] is True
+    assert resolution["approved_by"] == "reviewer-001"
+    assert resolution["reason"] == "Approve one bounded retry"
+    assert set(resolution) == {
+        "decision_id",
+        "approved",
+        "approved_by",
+        "reason",
+        "resolved_at",
+    }
+    assert not any(
+        key in resolution
+        for key in ("action", "parameter_changes", "budget", "file_path")
+    )
+
+    duplicate = web_server.api_resolve_recovery_approval(job.job_id, request)
+    assert duplicate.status_code == 409
+
+
+def test_recovery_approval_api_rejects_wrong_identity_and_project_scope(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    web_server, job, _project_root, control_dir = _prepare_recovery_approval_job(
+        monkeypatch,
+        tmp_path,
+        project="alpha",
+    )
+    pending = _recovery_pending_payload()
+    web_server.write_json(control_dir / "pending.json", pending)
+    other_dir = (
+        tmp_path
+        / "projects"
+        / "beta"
+        / "tmp"
+        / "feedback_recovery"
+        / job.job_id
+    )
+    other_dir.mkdir(parents=True)
+    web_server.write_json(
+        other_dir / "pending.json",
+        _recovery_pending_payload("decision-other-project"),
+    )
+
+    mismatch = web_server.api_resolve_recovery_approval(
+        job.job_id,
+        web_server.RecoveryApprovalRequest(
+            decision_id="decision-other-project",
+            approved=False,
+            reason="Reject the mismatched decision",
+        ),
+    )
+    assert mismatch.status_code == 409
+    assert not (control_dir / "resolution.json").exists()
+    assert not (other_dir / "resolution.json").exists()
+
+    wrong_stage = web_server.JobState("read_recovery_web", "read")
+    wrong_stage.status = "running"
+    wrong_stage.result = {"project": "alpha"}
+    web_server.JOBS[wrong_stage.job_id] = wrong_stage
+    response = web_server.api_get_recovery_approval(wrong_stage.job_id)
+    assert response.status_code == 409
+
+
+def test_generated_driver_carries_web_job_and_recovery_consumption_structure(tmp_path) -> None:
+    from orchestration import run_frontend
+
+    driver = tmp_path / "run_driver.py"
+    run_frontend.write_driver(
+        driver,
+        "demo",
+        1,
+        1,
+        0,
+        False,
+        False,
+        False,
+        False,
+        {"include_arxiv": False},
+        request_source="web",
+        web_job_id="find_recovery_web",
+    )
+
+    source = driver.read_text(encoding="utf-8")
+    compile(source, str(driver), "exec")
+    assert 'web_job_id = "find_recovery_web"' in source
+    assert "def _run_supervised_find_attempt(" in source
+    assert "def _consume_recovery_decision(" in source
+    assert source.count("_start_find_with_executor(attempt_run_context)") == 1
+    assert "supervisor.resolve_recovery_approval(" in source
+    assert "_execute_approved_recovery_decision(" in source
+    assert "pending.json" in source
+    assert "resolution.json" in source
+
+
+def test_recovery_approval_control_cleanup_is_scoped_to_one_job(tmp_path) -> None:
+    from orchestration import run_frontend
+
+    project_root = tmp_path / "project"
+    target = project_root / "tmp" / "feedback_recovery" / "find_job_001"
+    sibling = project_root / "tmp" / "feedback_recovery" / "find_job_002"
+    target.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    (target / "pending.json").write_text("{}", encoding="utf-8")
+    (target / "resolution.json").write_text("{}", encoding="utf-8")
+    (sibling / "pending.json").write_text("{}", encoding="utf-8")
+    outside = tmp_path / "outside-control"
+    outside.mkdir()
+    outside_pending = outside / "pending.json"
+    outside_pending.write_text("{}", encoding="utf-8")
+    unsafe_link = project_root / "tmp" / "feedback_recovery" / "unsafe_job"
+    if os.name == "posix":
+        unsafe_link.symlink_to(outside, target_is_directory=True)
+
+    run_frontend._cleanup_recovery_approval_control_files(
+        project_root,
+        "find_job_001",
+    )
+    run_frontend._cleanup_recovery_approval_control_files(project_root, "../unsafe")
+    if os.name == "posix":
+        run_frontend._cleanup_recovery_approval_control_files(project_root, "unsafe_job")
+
+    assert not target.exists()
+    assert sibling.joinpath("pending.json").is_file()
+    assert outside_pending.is_file()
 
 
 def test_run_frontend_builds_find_stage_request_before_starting_find():
     text = (ROOT / "framework" / "scripts" / "orchestration" / "run_frontend.py").read_text(encoding="utf-8")
 
     builder_call = text.index("find_stage_request = build_find_stage_request(")
-    process_start = text.index("executor, execution_handle, process = _start_find_with_executor(run_context)")
+    process_start = text.index(
+        "executor, execution_handle, process = _start_find_with_executor(attempt_run_context)"
+    )
 
     assert builder_call < process_start
     assert "research_topic=configured_topic" in text
@@ -1581,7 +1808,9 @@ def test_run_frontend_generated_driver_queries_read_only_experience_store_before
     query_index = source.index("experience_query = build_experience_query(")
     store_index = source.index("experience_store = JsonExperienceStore(")
     search_index = source.index("matched_experiences = experience_store.search_cases(")
-    process_index = source.index("executor, execution_handle, process = _start_find_with_executor(run_context)")
+    process_index = source.index(
+        "executor, execution_handle, process = _start_find_with_executor(attempt_run_context)"
+    )
 
     assert request_index < query_index < store_index < search_index < process_index
     assert "build_experience_query" in source
@@ -1619,7 +1848,9 @@ def test_run_frontend_generated_driver_adapts_matched_find_experiences(tmp_path)
     runtime_write_index = source.index(
         "write_json_file(find_config_path, runtime_find_config)"
     )
-    process_index = source.index("executor, execution_handle, process = _start_find_with_executor(run_context)")
+    process_index = source.index(
+        "executor, execution_handle, process = _start_find_with_executor(attempt_run_context)"
+    )
 
     assert "from feedback import (" in source
     assert "FindFeedbackAdapter," in source
@@ -1705,12 +1936,14 @@ def test_run_frontend_feedback_wiring_preserves_find_launch_contract(tmp_path):
     runtime_write_index = source.index(
         "write_json_file(find_config_path, runtime_find_config)"
     )
-    process_index = source.index("executor, execution_handle, process = _start_find_with_executor(run_context)")
+    process_index = source.index(
+        "executor, execution_handle, process = _start_find_with_executor(attempt_run_context)"
+    )
 
     assert runtime_write_index < process_index
     assert "write_json_file(input_path, input_payload)" in source
     assert "selection_path.write_text(json.dumps(selection_payload" in source
-    assert "_start_find_with_executor(run_context)" in source
+    assert source.count("_start_find_with_executor(attempt_run_context)") == 1
     assert "_register_find_process_exit_cleanup(process)" in source
     assert "_consume_execution_logs(" in source
     assert "_parse_find_cli_result(stdout_output, finding_module)" in source
@@ -1749,33 +1982,57 @@ def test_generated_driver_wires_supervisor_between_context_and_executor(tmp_path
     context_index = source.index("run_context = FindFeedbackAdapter().adapt(")
     supervisor_index = source.index("supervisor = FeedbackSupervisor(")
     executor_index = source.index(
-        "executor, execution_handle, process = _start_find_with_executor(run_context)"
+        "executor, execution_handle, process = _start_find_with_executor(attempt_run_context)"
     )
     terminal_index = source.index(
-        "    _notify_feedback_process_exited()\n    terminal_feedback_called = True"
+        "        notify_feedback_process_exited()\n        terminal_feedback_called = True"
     )
-    exit_index = source.index("if returncode != 0:")
+    initial_attempt_index = source.index(
+        "execution_handle, stdout_output = _run_supervised_find_attempt("
+    )
+    consume_index = source.index("recovery_execution_handle = _consume_recovery_decision(")
+    exit_index = source.index("if returncode != 0:", consume_index)
     parse_index = source.index(
-        "run_id, directory, result = _parse_find_cli_result(stdout_output, finding_module)"
+        "run_id, directory, result = _parse_find_cli_result(stdout_output, finding_module)",
+        consume_index,
     )
     publish_index = source.index("adopt_taste_find_run(")
 
     assert context_index < supervisor_index < executor_index
-    assert executor_index < terminal_index < exit_index < parse_index < publish_index
+    assert executor_index < terminal_index < initial_attempt_index < consume_index
+    assert consume_index < exit_index < parse_index < publish_index
     assert "experience_store=experience_store" in source
     assert source.count("JsonExperienceStore(") == 1
-    assert "recovery_advisor=None" in source
-    assert "LLMRecoveryAdvisor" not in source
-    assert "on_monitor_tick=_on_feedback_monitor_tick" in source
+    assert "from contracts.web_models import AppConfig" in source
+    assert "from integrations.web_llm import LLMClient" in source
+    assert "LLMRecoveryAdvisor," in source
+    assert "FindRecoveryApprovalGate," in source
+    assert "feedback_approval_gate = FindRecoveryApprovalGate()" in source
+    assert "approval_gate=feedback_approval_gate" in source
+    assert "recovery_llm_payload = dict(local_llm)" in source
+    assert "recovery_llm_config = AppConfig(**recovery_llm_payload)" in source
+    assert 'LLMClient(recovery_llm_config, role="find")' in source
+    assert "if recovery_llm_client.enabled" in source
+    assert "recovery_advisor=recovery_advisor" in source
+    assert "recovery_advisor=None" not in source
+    advisor_start = source.index("recovery_llm_payload = dict(local_llm)")
+    advisor_end = source.index("supervisor = FeedbackSupervisor(")
+    assert ".chat(" not in source[advisor_start:advisor_end]
+    assert "on_monitor_tick=on_feedback_monitor_tick" in source
     assert "feedback_decisions.append(decision)" in source
-    assert "decision.action" not in source
+    assert "def _consume_recovery_decision(" in source[supervisor_index:]
     assert 'TASTE_FEEDBACK_TRACE ' in source
     assert '"event": "monitor_started"' in source
     assert '"event": "summary"' in source
 
 
 @pytest.mark.skipif(os.name != "posix", reason="the isolated generated driver uses POSIX symlinks")
-def test_generated_driver_runs_isolated_feedback_executor_chain(tmp_path, monkeypatch):
+@pytest.mark.parametrize("advisor_enabled", [False, True], ids=["advisor-disabled", "advisor-enabled"])
+def test_generated_driver_runs_isolated_feedback_executor_chain(
+    tmp_path,
+    monkeypatch,
+    advisor_enabled,
+):
     from feedback import (
         EvidenceRef,
         ExperienceCase,
@@ -1952,6 +2209,29 @@ print(json.dumps({{"run_id": "find-offline-e2e", "run_dir": str(run_dir)}}), flu
         "{}\n",
         encoding="utf-8",
     )
+    secret_marker = "advisor-secret-must-not-leak"
+    local_llm_path = isolated_root / "modules" / "finding" / "config" / "llm.local.json"
+    local_llm_path.write_text(
+        json.dumps(
+            {
+                "provider": "global-test-provider",
+                "base_url": "https://global.invalid/v1",
+                "api_key": secret_marker if advisor_enabled else "",
+                "model": "global-test-model",
+                "temperature": 0.2,
+                "llm_roles": {
+                    "find": {
+                        "provider": "find-test-provider",
+                        "base_url": "https://find.invalid/v1",
+                        "api_key": secret_marker if advisor_enabled else "",
+                        "model": "find-test-model",
+                        "temperature": 0.1,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     instrumentation_dir.joinpath("sitecustomize.py").write_text(
         f'''\
 import atexit
@@ -1959,6 +2239,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+
+from integrations.web_llm import LLMClient
 
 capture_path = Path(os.environ["OFFLINE_DRIVER_CAPTURE_PATH"])
 active_handles = []
@@ -1974,6 +2256,11 @@ def tracked_popen(*args, **kwargs):
     return process
 subprocess.Popen = tracked_popen
 
+def reject_live_chat(self, *args, **kwargs):
+    record("advisor_chat")
+    raise AssertionError("offline generated driver must not call LLMClient.chat")
+LLMClient.chat = reject_live_chat
+
 from orchestration import run_frontend
 original_start = run_frontend._start_find_with_executor
 def capture_start(run_context):
@@ -1986,10 +2273,29 @@ run_frontend._start_find_with_executor = capture_start
 from feedback import (
     FeedbackSupervisor,
     FileProgressObserver,
+    FindRecoveryApprovalGate,
     FindAnomalyBuilder,
     FindRecoveryController,
     FindResultValidator,
+    LLMRecoveryAdvisor,
 )
+
+original_gate_init = FindRecoveryApprovalGate.__init__
+def capture_gate_init(self):
+    record("approval_gate_init")
+    return original_gate_init(self)
+FindRecoveryApprovalGate.__init__ = capture_gate_init
+original_gate_resolve = FindRecoveryApprovalGate.resolve
+def capture_gate_resolve(self, **kwargs):
+    record("approval_gate_resolve")
+    return original_gate_resolve(self, **kwargs)
+FindRecoveryApprovalGate.resolve = capture_gate_resolve
+
+original_advisor_init = LLMRecoveryAdvisor.__init__
+def capture_advisor_init(self, *, llm_client):
+    record("advisor_init", client=llm_client.summary())
+    return original_advisor_init(self, llm_client=llm_client)
+LLMRecoveryAdvisor.__init__ = capture_advisor_init
 
 original_observe = FileProgressObserver.observe
 def capture_observe(self, *args, **kwargs):
@@ -2081,6 +2387,7 @@ def capture_completed_handles():
             "WORKFLOW_RUNTIME_DIR": str(isolated_root / "modules" / "finding" / ".runtime"),
             "TASTE_FIND_INPUT_DIR": str(input_dir),
             "TASTE_INTERNAL_FIND_OUTPUT_DIR": str(output_dir),
+            "FINDING_LLM_CONFIG": str(local_llm_path),
             "OFFLINE_DRIVER_CAPTURE_PATH": str(capture_path),
             "PYTHONPATH": os.pathsep.join(
                 [str(instrumentation_dir), str(ROOT / "framework" / "scripts")]
@@ -2107,6 +2414,14 @@ def capture_completed_handles():
     validator_events = [event for event in events if event["event"] == "validator"]
     anomaly_events = [event for event in events if event["event"] == "anomaly_builder"]
     controller_events = [event for event in events if event["event"] == "controller"]
+    advisor_events = [event for event in events if event["event"] == "advisor_init"]
+    advisor_chat_events = [event for event in events if event["event"] == "advisor_chat"]
+    approval_gate_events = [
+        event for event in events if event["event"] == "approval_gate_init"
+    ]
+    approval_resolve_events = [
+        event for event in events if event["event"] == "approval_gate_resolve"
+    ]
     captured_context = started["run_context"]
     initial_handle = started["execution_handle"]
     completed_handle = finished["execution_handle"]
@@ -2202,6 +2517,28 @@ def capture_completed_handles():
     assert validator_events[0]["validation"]["status"] == "pass"
     assert anomaly_events[-1]["anomaly"] is None
     assert controller_events == []
+    expected_advisor_events = (
+        [
+            {
+                "event": "advisor_init",
+                "client": {
+                    "api_mode": "chat_completions",
+                    "base_url": "https://find.invalid/v1",
+                    "enabled": True,
+                    "model": "find-test-model",
+                    "provider": "find-test-provider",
+                    "role": "find",
+                    "temperature": 0.1,
+                },
+            }
+        ]
+        if advisor_enabled
+        else []
+    )
+    assert advisor_events == expected_advisor_events
+    assert advisor_chat_events == []
+    assert approval_gate_events == [{"event": "approval_gate_init"}]
+    assert approval_resolve_events == []
     command = popen_events[0]["command"]
     assert command[command.index("--config-json") + 1] == str(runtime_config_path)
     assert command[command.index("--input-json") + 1] == str(input_dir / "input.json")
@@ -2213,6 +2550,12 @@ def capture_completed_handles():
     assert runtime_config["config"]["runtime_tuning"]["ABSTRACT_SCORING_MAX_WORKERS"] == "1"
     assert "fake-find stdout" in Path(completed_handle["stdout_path"]).read_text(encoding="utf-8")
     assert "fake-find stderr" in Path(completed_handle["stderr_path"]).read_text(encoding="utf-8")
+    assert secret_marker not in driver.read_text(encoding="utf-8")
+    assert secret_marker not in runtime_config_path.read_text(encoding="utf-8")
+    assert secret_marker not in completed.stdout
+    assert secret_marker not in completed.stderr
+    assert secret_marker not in Path(completed_handle["stdout_path"]).read_text(encoding="utf-8")
+    assert secret_marker not in Path(completed_handle["stderr_path"]).read_text(encoding="utf-8")
     assert result_path.exists()
     assert result["run_id"] == "find-offline-e2e"
     assert input_payload == {
@@ -2227,6 +2570,522 @@ def capture_completed_handles():
     assert store_path.is_relative_to(tmp_path)
     assert runtime_config_path.is_relative_to(tmp_path)
     assert run_dir.is_relative_to(tmp_path)
+
+
+def _run_generated_driver_recovery_case(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    mode: str,
+    approval: bool | None,
+) -> SimpleNamespace:
+    from auto_research.web import server as web_server
+    from orchestration import run_frontend
+
+    isolated_root = tmp_path / "isolated-recovery-taste"
+    isolated_root.mkdir()
+    (isolated_root / "framework").symlink_to(ROOT / "framework", target_is_directory=True)
+    project_id = "offline-recovery-consumption"
+    project_root = isolated_root / "projects" / project_id
+    project_root.joinpath("config").mkdir(parents=True)
+    project_path = project_root / "project.json"
+    finding_config_path = project_root / "config" / "finding.json"
+    source_selection = {
+        "venue_ids": [],
+        "years": [2026],
+        "venue_years": [],
+        "include_arxiv": False,
+        "include_huggingface": False,
+        "include_github": False,
+        "include_biorxiv": False,
+        "include_nature": False,
+        "include_science": False,
+    }
+    project_path.write_text(
+        json.dumps(
+            {
+                "name": project_id,
+                "topic": "Offline recovery decision consumption",
+                "user_prompt": "No network is permitted.",
+                "queries": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    finding_config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config": {
+                    "abstract_scoring_max_workers": 1,
+                    "abstract_scoring_batch_size": 1,
+                    "abstract_scoring_timeout_sec": 15,
+                    "arxiv_timeout_sec": 15,
+                },
+                "selection": source_selection,
+            }
+        ),
+        encoding="utf-8",
+    )
+    project_before = project_path.read_bytes()
+    finding_config_before = finding_config_path.read_bytes()
+
+    finding_module = isolated_root / "modules" / "finding"
+    fake_entrypoint = finding_module / "main.py"
+    fake_entrypoint.parent.mkdir(parents=True)
+    counter_path = tmp_path / "fake-find-count.txt"
+    fake_entrypoint.write_text(
+        f'''\
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--action", required=True)
+parser.add_argument("--config-json", required=True)
+parser.add_argument("--input-json", required=True)
+args = parser.parse_args()
+counter_path = Path({str(counter_path)!r})
+attempt = int(counter_path.read_text(encoding="utf-8")) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(attempt), encoding="utf-8")
+run_id = "find-recovery-initial" if attempt == 1 else "find-recovery-success"
+run_dir = Path(os.environ["FINDING_RUNTIME_DIR"]) / "runs" / run_id
+run_dir.joinpath("logs").mkdir(parents=True)
+print(
+    "TASTE_FIND_EVENT "
+    + json.dumps({{"event": "find_run_created", "run_id": run_id, "run_dir": str(run_dir)}}),
+    file=sys.stderr,
+    flush=True,
+)
+(run_dir / "logs" / "find_progress.json").write_text(
+    json.dumps(
+        {{
+            "run_id": run_id,
+            "phase": "finding",
+            "counts": {{"candidates": 0 if attempt == 1 else 1}},
+            "live_progress": {{"current": 1, "total": 1, "percent": 100}},
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }}
+    ),
+    encoding="utf-8",
+)
+time.sleep(1.1)
+recovery_succeeds = attempt == 2 and {mode!r} != "automatic_failure"
+recommendations = [{{"id": "paper-recovered", "title": "Recovered result"}}] if recovery_succeeds else []
+config = json.loads(Path(args.config_json).read_text(encoding="utf-8"))
+result = {{
+    "run_id": run_id,
+    "strong_recommendations": recommendations,
+    "observed_config_path": args.config_json,
+    "observed_workers": config["config"]["abstract_scoring_max_workers"],
+}}
+(run_dir / "find_results.json").write_text(json.dumps(result), encoding="utf-8")
+print("fake recovery find stdout", flush=True)
+print("fake recovery find stderr", file=sys.stderr, flush=True)
+print(json.dumps({{"run_id": run_id, "run_dir": str(run_dir)}}), flush=True)
+''',
+        encoding="utf-8",
+    )
+    module_config_path = finding_module / "config" / "find.config.json"
+    module_config_path.parent.mkdir()
+    module_config_path.write_text("{}\n", encoding="utf-8")
+    module_config_before = module_config_path.read_bytes()
+    llm_config_path = finding_module / "config" / "llm.local.json"
+    llm_config_path.write_text(
+        json.dumps(
+            {
+                "provider": "openai_compatible",
+                "base_url": "https://offline.invalid/v1",
+                "api_key": "offline-test-key",
+                "model": "offline-test-model",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    capture_path = tmp_path / "recovery-capture.jsonl"
+    instrumentation_dir = tmp_path / "instrumentation"
+    instrumentation_dir.mkdir()
+    instrumentation_dir.joinpath("sitecustomize.py").write_text(
+        '''\
+import atexit
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import subprocess
+
+capture_path = Path(os.environ["RECOVERY_CAPTURE_PATH"])
+active_handles = []
+
+def record(event, **values):
+    with capture_path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"event": event, **values}, sort_keys=True) + "\\n")
+
+original_popen = subprocess.Popen
+def tracked_popen(*args, **kwargs):
+    process = original_popen(*args, **kwargs)
+    record("find_popen", pid=process.pid, command=args[0])
+    return process
+subprocess.Popen = tracked_popen
+
+from feedback import (
+    FeedbackSupervisor,
+    FileProgressObserver,
+    FindRecoveryApprovalGate,
+    FindResultValidator,
+    JsonExperienceStore,
+    LLMRecoveryAdvisor,
+    RecoveryAction,
+    RecoveryProposal,
+    RiskLevel,
+)
+
+original_recovery_search = JsonExperienceStore.search_recovery_cases
+def capture_recovery_search(self, query):
+    result = original_recovery_search(self, query)
+    record("recovery_store", count=len(result))
+    return result
+JsonExperienceStore.search_recovery_cases = capture_recovery_search
+
+def fake_propose(self, *, anomaly, run_context, supervisor_state, matched_experiences):
+    mode = os.environ["RECOVERY_CASE_MODE"]
+    risk = RiskLevel.MEDIUM if mode == "pending" else RiskLevel.LOW
+    record("advisor", anomaly_id=anomaly.anomaly_id, matched=len(matched_experiences))
+    return RecoveryProposal(
+        proposal_id="proposal-offline-recovery",
+        context_id=run_context.context_id,
+        run_id=anomaly.run_id,
+        anomaly_id=anomaly.anomaly_id,
+        created_at=datetime.now(timezone.utc),
+        proposed_action=RecoveryAction.RETRY_NEW_RUN,
+        reason="Synthetic test-only bounded recovery",
+        confidence=1.0,
+        risk_level=risk,
+        evidence_refs=list(anomaly.evidence_refs),
+    )
+LLMRecoveryAdvisor.propose = fake_propose
+
+original_gate_resolve = FindRecoveryApprovalGate.resolve
+def capture_gate_resolve(self, **kwargs):
+    result = original_gate_resolve(self, **kwargs)
+    record("gate", status=result.approval_status, executable=result.executable)
+    return result
+FindRecoveryApprovalGate.resolve = capture_gate_resolve
+
+original_observe = FileProgressObserver.observe
+def capture_observe(self, *args, **kwargs):
+    previous = args[2] if len(args) > 2 else kwargs.get("previous_snapshot")
+    result = original_observe(self, *args, **kwargs)
+    record(
+        "observer",
+        attempt_index=args[0].attempt_index,
+        previous_sequence=None if previous is None else previous.sequence,
+        run_id=result.run_id,
+    )
+    return result
+FileProgressObserver.observe = capture_observe
+
+original_validate = FindResultValidator.validate
+def capture_validate(self, execution_handle):
+    result = original_validate(self, execution_handle)
+    record("validator", run_id=result.run_id, status=result.status.value)
+    return result
+FindResultValidator.validate = capture_validate
+
+original_exited = FeedbackSupervisor.on_process_exited
+def capture_exited(self, **kwargs):
+    decision = original_exited(self, **kwargs)
+    state = self.state
+    record(
+        "supervisor_exited",
+        run_id=kwargs["execution_handle"].run_id,
+        root_run_id=state.root_run_id,
+        active_run_id=state.active_run_id,
+        decision=None if decision is None else decision.to_dict(),
+    )
+    return decision
+FeedbackSupervisor.on_process_exited = capture_exited
+
+original_resolve = FeedbackSupervisor.resolve_recovery_approval
+def capture_resolve(self, **kwargs):
+    result = original_resolve(self, **kwargs)
+    record("supervisor_resolve", decision_id=result.decision_id, status=result.approval_status)
+    return result
+FeedbackSupervisor.resolve_recovery_approval = capture_resolve
+
+from orchestration import run_frontend
+original_start = run_frontend._start_find_with_executor
+def capture_start(run_context):
+    executor, handle, process = original_start(run_context)
+    active_handles.append(handle)
+    record("start", attempt_index=run_context.attempt_index, handle=handle.to_dict())
+    return executor, handle, process
+run_frontend._start_find_with_executor = capture_start
+
+from bridges import reading_bridge, sync_outputs
+def capture_adopt(paths, payload, run_id):
+    record("publish", run_id=run_id, run_dir=payload["taste_run_dir"])
+sync_outputs.adopt_taste_find_run = capture_adopt
+def capture_read_default(*args, **kwargs):
+    record("read_default")
+    return {"status": "test-only"}
+reading_bridge.update_project_read_default_after_find = capture_read_default
+
+@atexit.register
+def capture_completed_handles():
+    for handle in active_handles:
+        record("completed_handle", handle=handle.to_dict())
+''',
+        encoding="utf-8",
+    )
+
+    web_job_id = "find_recovery_consumption_job"
+    driver = tmp_path / "recovery-driver.py"
+    monkeypatch.setattr(run_frontend, "ROOT", isolated_root)
+    run_frontend.write_driver(
+        driver,
+        project_id,
+        1,
+        1,
+        0,
+        False,
+        False,
+        False,
+        False,
+        source_selection,
+        request_source="web",
+        web_job_id=web_job_id,
+    )
+    monkeypatch.setattr(web_server, "PROJECT_IDS_ROOT", isolated_root / "projects")
+    job = web_server.JobState(web_job_id, "find")
+    job.status = "running"
+    job.result = {"project": project_id}
+    monkeypatch.setattr(web_server, "JOBS", {web_job_id: job})
+
+    environment = dict(os.environ)
+    for name in ("OPENAI_API_KEY", "LLM_API_KEY", "LLM_API_BASE", "LLM_MODEL", "LLM_PROVIDER"):
+        environment.pop(name, None)
+    environment.update(
+        {
+            "WORKSPACE_ROOT": str(isolated_root),
+            "FINDING_RUNTIME_DIR": str(finding_module / ".runtime"),
+            "WORKFLOW_RUNTIME_DIR": str(finding_module / ".runtime"),
+            "TASTE_FIND_INPUT_DIR": str(tmp_path / "driver-input"),
+            "FINDING_LLM_CONFIG": str(llm_config_path),
+            "RECOVERY_CAPTURE_PATH": str(capture_path),
+            "RECOVERY_CASE_MODE": "pending" if approval is not None else mode,
+            "PYTHONPATH": os.pathsep.join(
+                [str(instrumentation_dir), str(ROOT / "framework" / "scripts")]
+            ),
+        }
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(driver)],
+        cwd=isolated_root,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    api_response = None
+    try:
+        if approval is not None:
+            pending_path = (
+                project_root
+                / "tmp"
+                / "feedback_recovery"
+                / web_job_id
+                / "pending.json"
+            )
+            deadline = time.monotonic() + 20
+            while not pending_path.is_file() and process.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise AssertionError("generated driver did not publish pending recovery")
+                time.sleep(0.05)
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+            api_response = web_server.api_resolve_recovery_approval(
+                web_job_id,
+                web_server.RecoveryApprovalRequest(
+                    decision_id=pending["decision_id"],
+                    approved=approval,
+                    approved_by="offline-reviewer" if approval else "",
+                    reason="Approve bounded test recovery" if approval else "Reject test recovery",
+                ),
+            )
+        stdout, stderr = process.communicate(timeout=35)
+    finally:
+        if process.poll() is None:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            process.wait(timeout=10)
+        monkeypatch.setattr(run_frontend, "ROOT", ROOT)
+
+    events = [
+        json.loads(line)
+        for line in capture_path.read_text(encoding="utf-8").splitlines()
+    ]
+    return SimpleNamespace(
+        returncode=process.returncode,
+        stdout=stdout,
+        stderr=stderr,
+        events=events,
+        api_response=api_response,
+        project_root=project_root,
+        project_path=project_path,
+        project_before=project_before,
+        finding_config_path=finding_config_path,
+        finding_config_before=finding_config_before,
+        module_config_path=module_config_path,
+        module_config_before=module_config_before,
+        store_path=isolated_root / ".runtime" / "feedback" / "experience_cases.json",
+        input_dir=tmp_path / "driver-input",
+        web_job_id=web_job_id,
+        fake_find_count=int(counter_path.read_text(encoding="utf-8")),
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the recovery driver is verified in WSL/POSIX")
+def test_generated_driver_approves_pending_decision_and_publishes_recovery_run(
+    tmp_path,
+    monkeypatch,
+):
+    result = _run_generated_driver_recovery_case(
+        tmp_path,
+        monkeypatch,
+        mode="pending",
+        approval=True,
+    )
+    events = result.events
+    exits = [event for event in events if event["event"] == "supervisor_exited"]
+    validators = [event for event in events if event["event"] == "validator"]
+    observers = [event for event in events if event["event"] == "observer"]
+    completed_handles = [event["handle"] for event in events if event["event"] == "completed_handle"]
+
+    assert result.returncode == 0
+    assert result.api_response["status"] == "submitted"
+    assert result.fake_find_count == 2
+    assert len([event for event in events if event["event"] == "find_popen"]) == 2
+    assert len([event for event in events if event["event"] == "recovery_store"]) == 1
+    assert len([event for event in events if event["event"] == "advisor"]) == 1
+    assert len([event for event in events if event["event"] == "gate"]) == 1
+    assert len([event for event in events if event["event"] == "supervisor_resolve"]) == 1
+    assert [event["status"] for event in validators] == ["block", "pass"]
+    assert [event["run_id"] for event in exits] == [
+        "find-recovery-initial",
+        "find-recovery-success",
+    ]
+    assert exits[0]["root_run_id"] == "find-recovery-initial"
+    assert exits[1]["root_run_id"] == "find-recovery-initial"
+    assert exits[1]["active_run_id"] == "find-recovery-success"
+    assert any(
+        event["attempt_index"] == 1 and event["previous_sequence"] is None
+        for event in observers
+    )
+    assert [event["run_id"] for event in events if event["event"] == "publish"] == [
+        "find-recovery-success",
+        "find-recovery-success",
+    ]
+    assert len(completed_handles) == 2
+    assert all(handle["process_alive"] is False for handle in completed_handles)
+    assert all(handle["exit_code"] == 0 for handle in completed_handles)
+    recovery_handle = next(
+        handle for handle in completed_handles if handle["run_id"] == "find-recovery-success"
+    )
+    recovery_result = json.loads(
+        (Path(recovery_handle["run_dir"]) / "find_results.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    recovery_config_path = Path(recovery_result["observed_config_path"])
+    assert recovery_result["run_id"] == "find-recovery-success"
+    assert recovery_config_path != result.input_dir / "find.config.json"
+    assert recovery_config_path.is_relative_to(result.input_dir / "recovery")
+    assert recovery_config_path.is_file()
+    assert "fake recovery find stdout" in Path(recovery_handle["stdout_path"]).read_text(
+        encoding="utf-8"
+    )
+    assert "fake recovery find stderr" in Path(recovery_handle["stderr_path"]).read_text(
+        encoding="utf-8"
+    )
+    assert not (
+        result.project_root / "tmp" / "feedback_recovery" / result.web_job_id
+    ).exists()
+    assert result.project_path.read_bytes() == result.project_before
+    assert result.finding_config_path.read_bytes() == result.finding_config_before
+    assert result.module_config_path.read_bytes() == result.module_config_before
+    assert not result.store_path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the recovery driver is verified in WSL/POSIX")
+def test_generated_driver_rejects_pending_decision_without_recovery_find(
+    tmp_path,
+    monkeypatch,
+):
+    result = _run_generated_driver_recovery_case(
+        tmp_path,
+        monkeypatch,
+        mode="pending",
+        approval=False,
+    )
+
+    assert result.returncode != 0
+    assert result.api_response["status"] == "submitted"
+    assert result.fake_find_count == 1
+    assert len([event for event in result.events if event["event"] == "find_popen"]) == 1
+    assert [event["status"] for event in result.events if event["event"] == "gate"] == [
+        "rejected"
+    ]
+    assert not (result.input_dir / "recovery").exists()
+    assert not (
+        result.project_root / "tmp" / "feedback_recovery" / result.web_job_id
+    ).exists()
+    assert result.project_path.read_bytes() == result.project_before
+    assert result.finding_config_path.read_bytes() == result.finding_config_before
+    assert result.module_config_path.read_bytes() == result.module_config_before
+    assert not result.store_path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the recovery driver is verified in WSL/POSIX")
+@pytest.mark.parametrize(
+    ("mode", "expected_returncode", "expected_publish_count"),
+    [
+        pytest.param("automatic_success", 0, 2, id="not-required-success"),
+        pytest.param("automatic_failure", 1, 0, id="recovery-blocked"),
+    ],
+)
+def test_generated_driver_auto_recovery_runs_once_without_a_third_find(
+    tmp_path,
+    monkeypatch,
+    mode,
+    expected_returncode,
+    expected_publish_count,
+):
+    result = _run_generated_driver_recovery_case(
+        tmp_path,
+        monkeypatch,
+        mode=mode,
+        approval=None,
+    )
+
+    assert result.returncode == expected_returncode
+    assert result.fake_find_count == 2
+    assert len([event for event in result.events if event["event"] == "find_popen"]) == 2
+    assert [event for event in result.events if event["event"] == "gate"] == []
+    assert [event for event in result.events if event["event"] == "supervisor_resolve"] == []
+    assert len([event for event in result.events if event["event"] == "publish"]) == expected_publish_count
+    assert not (result.input_dir / "recovery").joinpath("recovery").exists()
+    assert not (
+        result.project_root / "tmp" / "feedback_recovery" / result.web_job_id
+    ).exists()
+    assert result.project_path.read_bytes() == result.project_before
+    assert result.finding_config_path.read_bytes() == result.finding_config_before
+    assert result.module_config_path.read_bytes() == result.module_config_before
+    assert not result.store_path.exists()
 
 
 def _run_generated_driver_terminal_case(tmp_path: Path, monkeypatch, mode: str):
@@ -2600,6 +3459,443 @@ def _make_local_find_run_context(tmp_path: Path, script: str):
         experience_query=ExperienceQuery(limit=1),
     )
 
+
+def _load_generated_recovery_executor(tmp_path: Path, monkeypatch, run_context):
+    from copy import deepcopy
+    from dataclasses import replace
+
+    from feedback import ExecutionHandle, RecoveryAction, RecoveryDecision, RunContext
+    from feedback.feedback_adapter import (
+        _SAFE_INTEGER_PARAMETERS,
+        _sync_runtime_tuning,
+    )
+    from orchestration import run_frontend
+
+    driver = tmp_path / "recovery-driver.py"
+    run_frontend.write_driver(
+        driver,
+        "recovery-test-project",
+        1,
+        1,
+        0,
+        False,
+        False,
+        False,
+        False,
+        {"include_arxiv": False},
+    )
+    source = driver.read_text(encoding="utf-8")
+    start = source.index("_executed_recovery_decision_ids = set()")
+    end = source.index("\nrecovery_advisor = None", start)
+    input_dir = Path(run_context.config_snapshot_path).parent
+    started = []
+
+    def capture_start(candidate_context):
+        result = run_frontend._start_find_with_executor(candidate_context)
+        started.append(result)
+        return result
+
+    registered = []
+
+    class CompletedSupervisor:
+        trace_summary = {"validation_status": "pass"}
+
+    def build_recovery_supervisor(**_kwargs):
+        return CompletedSupervisor()
+
+    def run_supervised_find_attempt(*, attempt_run_context, attempt_supervisor):
+        executor, handle, process = capture_start(attempt_run_context)
+        registered.append(process)
+        handle.exit_code = process.wait(timeout=10)
+        handle.process_alive = False
+        handle.run_id = "find-recovery-test"
+        handle.run_dir = str(tmp_path / "find-recovery-test")
+        return handle, Path(handle.stdout_path).read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    namespace = {
+        "Path": Path,
+        "ExecutionHandle": ExecutionHandle,
+        "RecoveryAction": RecoveryAction,
+        "RecoveryDecision": RecoveryDecision,
+        "RunContext": RunContext,
+        "_SAFE_INTEGER_PARAMETERS": _SAFE_INTEGER_PARAMETERS,
+        "_sync_runtime_tuning": _sync_runtime_tuning,
+        "_start_find_with_executor": capture_start,
+        "_register_find_process_exit_cleanup": registered.append,
+        "_build_recovery_supervisor": build_recovery_supervisor,
+        "_run_supervised_find_attempt": run_supervised_find_attempt,
+        "deepcopy": deepcopy,
+        "datetime": datetime,
+        "input_dir": input_dir,
+        "json": json,
+        "replace": replace,
+        "timezone": timezone,
+        "write_json_file": lambda path, payload: Path(path).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        ),
+    }
+    exec(compile(source[start:end], str(driver), "exec"), namespace)
+    return namespace["_execute_approved_recovery_decision"], started, registered
+
+
+def _make_recovery_decision(
+    *,
+    action,
+    approval_status="not_required",
+    executable=True,
+    parameter_changes=None,
+    target_sources=None,
+    decision_id="decision-recovery-001",
+):
+    from feedback import RecoveryAction, RecoveryDecision, RiskLevel
+
+    requires_approval = approval_status != "not_required"
+    approved = approval_status == "approved"
+    return RecoveryDecision(
+        decision_id=decision_id,
+        run_id="find-original-001",
+        anomaly_id="anomaly-recovery-001",
+        created_at=datetime.now(timezone.utc),
+        decided_at=datetime.now(timezone.utc),
+        producer="bridge-tests",
+        producer_version="v1",
+        action=RecoveryAction.REQUEST_APPROVAL if requires_approval else action,
+        reason="Synthetic recovery execution test",
+        risk_level=RiskLevel.MEDIUM if requires_approval else RiskLevel.LOW,
+        executable=executable,
+        new_run_required=action in {
+            RecoveryAction.RETRY_NEW_RUN,
+            RecoveryAction.RETRY_WITH_PARAMETER_CHANGE,
+            RecoveryAction.SKIP_OPTIONAL_SOURCE,
+        },
+        exploratory=False,
+        requires_approval=requires_approval,
+        approval_status=approval_status,
+        attempt_index=1,
+        budget_before=1,
+        budget_cost=1 if executable else 0,
+        budget_after=0 if executable else 1,
+        max_same_action_attempts=1,
+        verification_policy="find.validation.v1",
+        required_post_checks=["result_exists"],
+        success_definition="The isolated recovery run produces a result",
+        stop_if_failed=True,
+        proposed_action=action if requires_approval else None,
+        parameter_changes=[] if parameter_changes is None else parameter_changes,
+        target_sources=[] if target_sources is None else target_sources,
+        proposed_new_run_id="find-recovery-001" if executable else None,
+        approved_by="reviewer" if approved else None,
+        approved_at=datetime.now(timezone.utc) if approved else None,
+        approval_reason="Approved for isolated execution" if approved else None,
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the fake Find execution is verified in WSL/POSIX")
+def test_generated_driver_executes_approved_parameter_recovery_once(
+    tmp_path,
+    monkeypatch,
+):
+    from copy import deepcopy
+
+    from feedback import (
+        ExecutionHandle,
+        ParameterChange,
+        RecoveryAction,
+        RecoveryDecision,
+        RunContext,
+    )
+
+    observed_path = tmp_path / "observed-recovery.json"
+    script = f'''\
+import argparse
+import json
+import sys
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--action", required=True)
+parser.add_argument("--config-json", required=True)
+parser.add_argument("--input-json", required=True)
+args = parser.parse_args()
+config = json.loads(Path(args.config_json).read_text(encoding="utf-8"))
+Path({str(observed_path)!r}).write_text(
+    json.dumps({{"config_path": args.config_json, "payload": config}}),
+    encoding="utf-8",
+)
+print("recovery stdout", flush=True)
+print("recovery stderr", file=sys.stderr, flush=True)
+'''
+    run_context = _make_local_find_run_context(tmp_path, script)
+    input_dir = Path(run_context.config_snapshot_path).parent
+    selection_path = Path(run_context.selection_snapshot_path)
+    selection_path.write_text(
+        json.dumps(dict(run_context.selection)),
+        encoding="utf-8",
+    )
+    original_config = {
+        "schema_version": 1,
+        "config": {
+            "abstract_scoring_max_workers": 2,
+            "runtime_tuning": {
+                "ABSTRACT_SCORING_MAX_WORKERS": "2",
+                "ABSTRACT_SCORING_WORKER_CAP": "2",
+            },
+        },
+        "selection": dict(run_context.selection),
+    }
+    Path(run_context.config_snapshot_path).write_text(
+        json.dumps(original_config),
+        encoding="utf-8",
+    )
+    context_payload = run_context.to_dict()
+    context_payload.update(
+        {
+            "requested_parameters": deepcopy(original_config["config"]),
+            "effective_parameters": deepcopy(original_config["config"]),
+            "allowed_recovery_actions": [
+                RecoveryAction.RETRY_NEW_RUN.value,
+                RecoveryAction.RETRY_WITH_PARAMETER_CHANGE.value,
+            ],
+        }
+    )
+    run_context = RunContext.from_dict(context_payload)
+    decision = _make_recovery_decision(
+        action=RecoveryAction.RETRY_WITH_PARAMETER_CHANGE,
+        approval_status="approved",
+        parameter_changes=[
+            ParameterChange(
+                name="abstract_scoring_max_workers",
+                before=2,
+                after=1,
+                reason="Synthetic bounded reduction",
+            )
+        ],
+    )
+    context_before = run_context.to_json()
+    decision_before = decision.to_json()
+    original_files = {
+        path.name: path.read_bytes()
+        for path in input_dir.iterdir()
+        if path.is_file()
+    }
+    execute_recovery, started, registered = _load_generated_recovery_executor(
+        tmp_path,
+        monkeypatch,
+        run_context,
+    )
+
+    handle = execute_recovery(decision=decision, run_context=run_context)
+    process = started[0][2]
+    assert process.returncode == 0
+
+    assert len(started) == 1
+    signature = inspect.signature(execute_recovery, eval_str=True)
+    assert list(signature.parameters) == ["decision", "run_context"]
+    assert signature.parameters["decision"].annotation is RecoveryDecision
+    assert signature.parameters["run_context"].annotation is RunContext
+    assert signature.return_annotation is ExecutionHandle
+    assert registered == [process]
+    assert handle is started[0][1]
+    assert handle.context_id == run_context.context_id
+    recovery_dir = input_dir / "recovery" / decision.proposed_new_run_id
+    recovery_config_path = recovery_dir / "find.config.json"
+    recovery_config = json.loads(recovery_config_path.read_text(encoding="utf-8"))
+    observed = json.loads(observed_path.read_text(encoding="utf-8"))
+    assert observed["config_path"] == str(recovery_config_path)
+    assert observed["payload"] == recovery_config
+    assert recovery_config["config"]["abstract_scoring_max_workers"] == 1
+    assert recovery_config["config"]["runtime_tuning"]["ABSTRACT_SCORING_MAX_WORKERS"] == "1"
+    assert recovery_config["config"]["runtime_tuning"]["ABSTRACT_SCORING_WORKER_CAP"] == "1"
+    assert json.loads((recovery_dir / "input.json").read_text(encoding="utf-8")) == json.loads(
+        Path(run_context.input_snapshot_path).read_text(encoding="utf-8")
+    )
+    assert json.loads((recovery_dir / "selection.json").read_text(encoding="utf-8")) == dict(
+        run_context.selection
+    )
+    assert run_context.to_json() == context_before
+    assert decision.to_json() == decision_before
+    assert {
+        path.name: path.read_bytes()
+        for path in input_dir.iterdir()
+        if path.is_file()
+    } == original_files
+    assert "recovery stdout" in Path(handle.stdout_path).read_text(encoding="utf-8")
+    assert "recovery stderr" in Path(handle.stderr_path).read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the fake Find execution is verified in WSL/POSIX")
+def test_generated_driver_executes_not_required_retry_new_run_once_and_rejects_repeat(
+    tmp_path,
+    monkeypatch,
+):
+    from feedback import RecoveryAction, RunContext
+
+    observed_path = tmp_path / "observed-retry.json"
+    script = f'''\
+import argparse
+import json
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument("--action", required=True)
+parser.add_argument("--config-json", required=True)
+parser.add_argument("--input-json", required=True)
+args = parser.parse_args()
+Path({str(observed_path)!r}).write_text(
+    json.dumps({{"config": json.loads(Path(args.config_json).read_text(encoding="utf-8")), "input": json.loads(Path(args.input_json).read_text(encoding="utf-8"))}}),
+    encoding="utf-8",
+)
+'''
+    run_context = _make_local_find_run_context(tmp_path, script)
+    selection_path = Path(run_context.selection_snapshot_path)
+    selection_path.write_text(json.dumps(dict(run_context.selection)), encoding="utf-8")
+    payload = run_context.to_dict()
+    payload["allowed_recovery_actions"] = [RecoveryAction.RETRY_NEW_RUN.value]
+    run_context = RunContext.from_dict(payload)
+    decision = _make_recovery_decision(action=RecoveryAction.RETRY_NEW_RUN)
+    execute_recovery, started, _registered = _load_generated_recovery_executor(
+        tmp_path,
+        monkeypatch,
+        run_context,
+    )
+
+    execute_recovery(decision=decision, run_context=run_context)
+    process = started[0][2]
+    assert process.returncode == 0
+    with pytest.raises(RuntimeError, match="already been executed"):
+        execute_recovery(decision=decision, run_context=run_context)
+
+    observed = json.loads(observed_path.read_text(encoding="utf-8"))
+    assert len(started) == 1
+    assert observed["config"]["config"] == dict(run_context.effective_parameters)
+    assert observed["config"]["selection"] == dict(run_context.selection)
+    assert observed["input"] == json.loads(
+        Path(run_context.input_snapshot_path).read_text(encoding="utf-8")
+    )
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        pytest.param(
+            _make_recovery_decision(
+                action=__import__("feedback").RecoveryAction.RETRY_NEW_RUN,
+                approval_status="pending",
+                executable=False,
+            ),
+            id="pending",
+        ),
+        pytest.param(
+            _make_recovery_decision(
+                action=__import__("feedback").RecoveryAction.RETRY_NEW_RUN,
+                approval_status="rejected",
+                executable=False,
+            ),
+            id="rejected",
+        ),
+        pytest.param(
+            _make_recovery_decision(
+                action=__import__("feedback").RecoveryAction.STOP_AND_REPORT,
+                executable=False,
+            ),
+            id="stop-and-report",
+        ),
+        pytest.param(
+            _make_recovery_decision(
+                action=__import__("feedback").RecoveryAction.NO_ACTION,
+                executable=False,
+            ),
+            id="no-action",
+        ),
+        pytest.param(
+            _make_recovery_decision(
+                action=__import__("feedback").RecoveryAction.SKIP_OPTIONAL_SOURCE,
+                target_sources=["semantic_scholar"],
+            ),
+            id="skip-optional-source",
+        ),
+    ],
+)
+def test_generated_driver_recovery_executor_rejects_without_side_effects(
+    tmp_path,
+    monkeypatch,
+    decision,
+):
+    run_context = _make_local_find_run_context(tmp_path, "print('must not start')\n")
+    Path(run_context.selection_snapshot_path).write_text(
+        json.dumps(dict(run_context.selection)),
+        encoding="utf-8",
+    )
+    execute_recovery, started, registered = _load_generated_recovery_executor(
+        tmp_path,
+        monkeypatch,
+        run_context,
+    )
+    input_dir = Path(run_context.config_snapshot_path).parent
+    before = sorted(str(path.relative_to(input_dir)) for path in input_dir.rglob("*"))
+
+    with pytest.raises((RuntimeError, ValueError)):
+        execute_recovery(decision=decision, run_context=run_context)
+
+    assert sorted(str(path.relative_to(input_dir)) for path in input_dir.rglob("*")) == before
+    assert started == []
+    assert registered == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(("abstract_scoring_max_workers", 3, 1), id="stale-before"),
+        pytest.param(("nonvenue_fetch_limit", 2, 1), id="non-whitelisted"),
+    ],
+)
+def test_generated_driver_recovery_executor_rejects_invalid_parameter_change_before_writes(
+    tmp_path,
+    monkeypatch,
+    change,
+):
+    from feedback import ParameterChange, RecoveryAction, RunContext
+
+    run_context = _make_local_find_run_context(tmp_path, "print('must not start')\n")
+    Path(run_context.selection_snapshot_path).write_text(
+        json.dumps(dict(run_context.selection)),
+        encoding="utf-8",
+    )
+    payload = run_context.to_dict()
+    payload["effective_parameters"] = {"abstract_scoring_max_workers": 2}
+    payload["requested_parameters"] = {"abstract_scoring_max_workers": 2}
+    payload["allowed_recovery_actions"] = [
+        RecoveryAction.RETRY_WITH_PARAMETER_CHANGE.value
+    ]
+    run_context = RunContext.from_dict(payload)
+    name, before_value, after_value = change
+    decision = _make_recovery_decision(
+        action=RecoveryAction.RETRY_WITH_PARAMETER_CHANGE,
+        parameter_changes=[
+            ParameterChange(
+                name=name,
+                before=before_value,
+                after=after_value,
+                reason="Synthetic invalid change",
+            )
+        ],
+    )
+    execute_recovery, started, _registered = _load_generated_recovery_executor(
+        tmp_path,
+        monkeypatch,
+        run_context,
+    )
+    input_dir = Path(run_context.config_snapshot_path).parent
+    before = sorted(str(path.relative_to(input_dir)) for path in input_dir.rglob("*"))
+
+    with pytest.raises(ValueError):
+        execute_recovery(decision=decision, run_context=run_context)
+
+    assert sorted(str(path.relative_to(input_dir)) for path in input_dir.rglob("*")) == before
+    assert started == []
 
 def _make_unbound_execution_handle(tmp_path: Path):
     from feedback import ExecutionHandle
@@ -2986,20 +4282,29 @@ for index in range(20):
 '''
     run_context = _make_local_find_run_context(tmp_path, script)
     _, execution_handle, process = run_frontend._start_find_with_executor(run_context)
-    callback_handles = []
+    callback_events = []
+
+    def capture_monitor_tick(handle):
+        callback_events.append((time.monotonic(), handle))
+
     try:
         stdout_output = run_frontend._consume_execution_logs(
             process,
             execution_handle,
             lambda _text: None,
             poll_interval=0.002,
-            on_monitor_tick=callback_handles.append,
+            on_monitor_tick=capture_monitor_tick,
         )
     finally:
         _stop_test_process(process)
 
     assert "stdout-19" in stdout_output
-    assert callback_handles == [execution_handle]
+    assert callback_events
+    assert all(handle is execution_handle for _, handle in callback_events)
+    assert all(
+        later - earlier >= 0.9
+        for (earlier, _), (later, _) in zip(callback_events, callback_events[1:])
+    )
     assert execution_handle.process_alive is False
     assert execution_handle.exit_code == 0
 

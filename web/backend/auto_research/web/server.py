@@ -34,7 +34,7 @@ for _entry in [str(path) for path in reversed(_IMPORT_PRIORITY_DIRS) if path.exi
 
 from bridges.finding_catalog import catalog_by_id, fetch_venue_sample, load_catalog
 from bridges.project_bridge import action_gate_blocker, job_stage, create_project_config, detect_runtime_config, list_projects as list_projects, project_summary, run_action, runtime_status, update_project_config, update_runtime_config, _cleruntime_caches, _current_find_pipeline_summary, _current_find_source_status_rows, _venue_metadata_counts
-from contracts.web_models import AppConfig, EmailJobRequest, FindRequest, IdeaMarkdownUpdate, IdeaPatch, IdeaRequest, LLMRoleConfig, PlanMarkdownUpdate, PlanPolishRequest, PlanRequest, ReadRequest, VenueHealthRequest
+from contracts.web_models import AppConfig, EmailJobRequest, FindRequest, IdeaMarkdownUpdate, IdeaPatch, IdeaRequest, LLMRoleConfig, PlanMarkdownUpdate, PlanPolishRequest, PlanRequest, ReadRequest, RecoveryApprovalRequest, VenueHealthRequest
 from integrations.emailer import send_run_email
 from policies.source_selection import canonical_source_selection, normalize_source_selection, save_canonical_source_selection, project_config_path
 from project.project_paths import configured_max_read_papers
@@ -12103,6 +12103,60 @@ def _safe_project_root(project: str) -> Path:
     return root
 
 
+_RECOVERY_APPROVAL_PENDING_FIELDS = frozenset(
+    {
+        "decision_id",
+        "run_id",
+        "anomaly_id",
+        "proposed_action",
+        "risk_level",
+        "reason",
+        "parameter_changes",
+        "target_sources",
+        "approval_status",
+    }
+)
+
+
+def _recovery_approval_control_dir(job_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(job_id or "")):
+        raise ValueError("invalid recovery approval job ID")
+    job = JOBS.get(job_id)
+    if job is None:
+        raise LookupError("job not found")
+    if _public_taste_stage(job.stage) != "find":
+        raise ValueError("recovery approval is only available for Find jobs")
+    project = _project_from_job_payload(job_id, None, job)
+    if not project:
+        raise ValueError("Find job project could not be resolved")
+    project_root = _safe_project_root(project).resolve()
+    control_root = (project_root / "tmp" / "feedback_recovery").resolve()
+    if project_root not in control_root.parents:
+        raise ValueError("recovery approval path is outside the project")
+    control_dir = (control_root / job_id).resolve()
+    if control_dir.parent != control_root:
+        raise ValueError("recovery approval path is outside the control directory")
+    return control_dir
+
+
+def _read_recovery_pending(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("pending recovery approval is unavailable") from error
+    if not isinstance(payload, dict) or set(payload) != _RECOVERY_APPROVAL_PENDING_FIELDS:
+        raise ValueError("pending recovery approval is invalid")
+    if (
+        not isinstance(payload.get("decision_id"), str)
+        or not payload["decision_id"]
+        or payload.get("approval_status") != "pending"
+        or not isinstance(payload.get("parameter_changes"), list)
+        or not isinstance(payload.get("target_sources"), list)
+    ):
+        raise ValueError("pending recovery approval is invalid")
+    return payload
+
+
 PROJECT_STAGE_EXCLUSIVE_ACTIONS = {"environment", "experiment", "paper", "full-cycle", "full_research_cycle", "autonomous"}
 PROJECT_STAGE_EXCLUSIVE_PHASES = {"environment", "experiment", "paper"}
 _FIND_PROCESS_WORKER_KINDS = {"frontend_recovery", "driver_recovery"}
@@ -12974,6 +13028,83 @@ def api_job(job_id: str, compact: bool = Query(True)) -> dict:
     if compact:
         merged_item = _compact_job_for_list(merged_item)
     return _public_job_api_payload(merged_item)
+
+
+@app.get("/api/jobs/{job_id}/recovery-approval")
+def api_get_recovery_approval(job_id: str) -> dict:
+    try:
+        control_dir = _recovery_approval_control_dir(job_id)
+    except LookupError:
+        return JSONResponse({"error": "job not found"}, status_code=404)
+    except ValueError as error:
+        return JSONResponse({"error": str(error)}, status_code=409)
+
+    pending_path = control_dir / "pending.json"
+    if not pending_path.is_file():
+        return {"status": "no_pending", "job_id": job_id, "pending": None}
+    try:
+        pending = _read_recovery_pending(pending_path)
+    except ValueError as error:
+        return JSONResponse({"error": str(error)}, status_code=409)
+    return {"status": "pending", "job_id": job_id, "pending": pending}
+
+
+@app.post("/api/jobs/{job_id}/recovery-approval")
+def api_resolve_recovery_approval(
+    job_id: str,
+    request: RecoveryApprovalRequest,
+) -> dict:
+    try:
+        control_dir = _recovery_approval_control_dir(job_id)
+    except LookupError:
+        return JSONResponse({"error": "job not found"}, status_code=404)
+    except ValueError as error:
+        return JSONResponse({"error": str(error)}, status_code=409)
+
+    job = JOBS[job_id]
+    if job.status not in {"queued", "running"} or job.cancel_requested:
+        return JSONResponse(
+            {"error": "recovery approval is no longer active"},
+            status_code=409,
+        )
+    pending_path = control_dir / "pending.json"
+    resolution_path = control_dir / "resolution.json"
+    with JOBS_LOCK:
+        if resolution_path.exists():
+            return JSONResponse(
+                {"error": "recovery approval was already submitted"},
+                status_code=409,
+            )
+        if not pending_path.is_file():
+            return JSONResponse(
+                {"error": "pending recovery approval was not found"},
+                status_code=409,
+            )
+        try:
+            pending = _read_recovery_pending(pending_path)
+        except ValueError as error:
+            return JSONResponse({"error": str(error)}, status_code=409)
+        if request.decision_id != pending["decision_id"]:
+            return JSONResponse(
+                {"error": "recovery decision identity does not match"},
+                status_code=409,
+            )
+        write_json(
+            resolution_path,
+            {
+                "decision_id": request.decision_id,
+                "approved": request.approved,
+                "approved_by": request.approved_by,
+                "reason": request.reason,
+                "resolved_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            },
+        )
+    return {
+        "status": "submitted",
+        "job_id": job_id,
+        "decision_id": request.decision_id,
+        "approved": request.approved,
+    }
 
 
 @app.post("/api/jobs/{job_id}/cancel")

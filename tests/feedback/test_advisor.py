@@ -38,10 +38,23 @@ class FakeLLMClient:
     def __init__(self, response: object | Exception) -> None:
         self.response = response
         self.prompts: list[str] = []
+        self.calls: list[dict[str, bool]] = []
         self.api_key = "test-api-key-must-not-appear"
 
-    def chat(self, prompt: str) -> object:
+    def chat(
+        self,
+        prompt: str,
+        *,
+        omit_max_tokens: bool = False,
+        allow_reasoning_fallback: bool = True,
+    ) -> object:
         self.prompts.append(prompt)
+        self.calls.append(
+            {
+                "omit_max_tokens": omit_max_tokens,
+                "allow_reasoning_fallback": allow_reasoning_fallback,
+            }
+        )
         if isinstance(self.response, Exception):
             raise self.response
         return self.response
@@ -291,6 +304,129 @@ def test_advisor_builds_proposal_with_code_owned_identity(monkeypatch) -> None:
     assert proposal.anomaly_id == anomaly.anomaly_id
     assert proposal.evidence_refs == [anomaly.evidence_refs[0]]
     assert len(client.prompts) == 1
+
+
+def test_advisor_omits_local_token_limit_and_rejects_reasoning_fallback() -> None:
+    client = FakeLLMClient(_response())
+
+    proposal = _call(LLMRecoveryAdvisor(llm_client=client))
+
+    assert isinstance(proposal, RecoveryProposal)
+    assert client.calls == [
+        {
+            "omit_max_tokens": True,
+            "allow_reasoning_fallback": False,
+        }
+    ]
+
+
+def test_llm_client_omits_max_tokens_when_requested(monkeypatch) -> None:
+    from contracts.web_models import AppConfig
+    from integrations import web_llm
+
+    payloads: list[dict[str, object]] = []
+
+    class BodyResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {"choices": [{"message": {"content": '{"ok":true}'}}]}
+            ).encode("utf-8")
+
+    def fake_urlopen(request, **_kwargs):
+        payloads.append(json.loads(request.data.decode("utf-8")))
+        return BodyResponse()
+
+    monkeypatch.setenv("LLM_RETRIES", "1")
+    monkeypatch.setattr(web_llm.urllib.request, "urlopen", fake_urlopen)
+    client = web_llm.LLMClient(
+        AppConfig(
+            provider="openai",
+            base_url="https://llm.example.test/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        role="find",
+    )
+
+    result = client.chat(
+        "Return JSON only.",
+        omit_max_tokens=True,
+        allow_reasoning_fallback=False,
+    )
+    default_result = client.chat(
+        "Return JSON only.",
+        allow_reasoning_fallback=False,
+    )
+
+    assert result == '{"ok":true}'
+    assert default_result == '{"ok":true}'
+    assert len(payloads) == 2
+    assert "max_tokens" not in payloads[0]
+    assert "max_output_tokens" not in payloads[0]
+    assert payloads[1]["max_tokens"] == client.max_tokens
+
+
+def test_llm_client_strict_path_never_returns_reasoning_content(monkeypatch) -> None:
+    from contracts.web_models import AppConfig
+    from integrations import web_llm
+
+    calls = 0
+    reasoning = '{"must_not":"be_returned"}'
+
+    class BodyResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {
+                                "content": "",
+                                "reasoning_content": reasoning,
+                            },
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(_request, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return BodyResponse()
+
+    monkeypatch.setenv("LLM_RETRIES", "1")
+    monkeypatch.setattr(web_llm.urllib.request, "urlopen", fake_urlopen)
+    client = web_llm.LLMClient(
+        AppConfig(
+            provider="openai",
+            base_url="https://llm.example.test/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        role="find",
+    )
+
+    with pytest.raises(RuntimeError, match="no extractable text") as caught:
+        client.chat(
+            "Return JSON only.",
+            omit_max_tokens=True,
+            allow_reasoning_fallback=False,
+        )
+
+    assert calls == 2
+    assert reasoning not in str(caught.value)
 
 
 def test_advisor_summarizes_inputs_without_mutation_or_sensitive_content() -> None:

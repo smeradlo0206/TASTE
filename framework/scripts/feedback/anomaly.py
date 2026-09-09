@@ -62,6 +62,20 @@ _RESULT_KINDS = frozenset(
         "reading_bridge_rejected",
     }
 )
+_RECOVERY_ELIGIBLE_KINDS = frozenset(
+    {
+        "progress_stalled",
+        "process_exited_nonzero",
+        "empty_recommendations",
+        "recommendation_shortfall",
+    }
+)
+_RETRYABLE_SIGNAL_KINDS = frozenset(
+    {
+        "progress_stalled",
+        "process_exited_nonzero",
+    }
+)
 
 
 def _progress_artifact(snapshot: ProgressSnapshot) -> ArtifactRef | None:
@@ -448,6 +462,10 @@ class FindAnomalyBuilder:
             if validation_result is not None
             else progress_snapshot.run_id  # type: ignore[union-attr]
         )
+        recovery_eligible = bool(run_id) and primary_kind in _RECOVERY_ELIGIBLE_KINDS
+        retryable_signal = (
+            recovery_eligible and primary_kind in _RETRYABLE_SIGNAL_KINDS
+        )
         detected_at = max(
             [
                 *(
@@ -521,8 +539,8 @@ class FindAnomalyBuilder:
                 else "Find completion cannot be confirmed"
             ),
             partial_results_usable=False,
-            recovery_eligible=False,
-            retryable_signal=False,
+            recovery_eligible=recovery_eligible,
+            retryable_signal=retryable_signal,
             fingerprint=f"{primary_kind}:{source_id}",
             occurrence_count=1,
             **_optional_anomaly_fields(

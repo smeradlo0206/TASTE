@@ -14,6 +14,7 @@ from feedback import (
     ExperienceCase,
     ExperienceQuery,
     ExperienceRef,
+    FindAnomalyBuilder,
     FindRecoveryController,
     ParameterChange,
     RecoveryAction,
@@ -24,6 +25,8 @@ from feedback import (
     RunContext,
     SupervisorState,
     SupervisorStatus,
+    ValidationCheck,
+    ValidationResult,
     ValidationStatus,
 )
 from feedback.interfaces import (
@@ -446,8 +449,13 @@ def test_first_safe_experience_is_executable_and_store_query_is_mapped_once() ->
     case = _case()
     store = FakeRecoveryExperienceStore([case])
     advisor = FakeRecoveryAdvisor()
+    context = _run_context(external_costs_authorized=False)
 
-    decision, _, anomaly, context, _ = _decide(store=store, advisor=advisor)
+    decision, _, anomaly, context, _ = _decide(
+        store=store,
+        advisor=advisor,
+        run_context=context,
+    )
 
     assert decision.action is RecoveryAction.RETRY_WITH_PARAMETER_CHANGE
     assert decision.executable is True
@@ -498,16 +506,23 @@ def test_first_safe_experience_is_executable_and_store_query_is_mapped_once() ->
         "context-tags",
     ],
 )
-def test_rejected_store_cases_stop_without_advisor(case: ExperienceCase) -> None:
+def test_rejected_store_cases_fall_through_to_advisor(case: ExperienceCase) -> None:
     store = FakeRecoveryExperienceStore([case])
-    advisor = FakeRecoveryAdvisor()
+    anomaly = _anomaly()
+    context = _run_context()
+    advisor = FakeRecoveryAdvisor(_proposal(anomaly, context))
 
-    decision, _, _, _, _ = _decide(store=store, advisor=advisor)
+    decision, _, _, _, _ = _decide(
+        store=store,
+        advisor=advisor,
+        anomaly=anomaly,
+        run_context=context,
+    )
 
-    assert decision.action is RecoveryAction.STOP_AND_REPORT
-    assert decision.executable is False
+    assert decision.action is RecoveryAction.RETRY_WITH_PARAMETER_CHANGE
+    assert decision.executable is True
     assert store.calls == 1
-    assert advisor.calls == 0
+    assert advisor.calls == 1
 
 
 @pytest.mark.parametrize(
@@ -561,7 +576,10 @@ def test_disallowed_experience_action_stops() -> None:
 
 def test_higher_risk_experience_requires_approval_when_within_threshold() -> None:
     case = _case(risk_level=RiskLevel.HIGH)
-    context = _run_context(approval_risk_threshold=RiskLevel.HIGH)
+    context = _run_context(
+        approval_risk_threshold=RiskLevel.HIGH,
+        external_costs_authorized=False,
+    )
 
     decision, _, _, _, _ = _decide(
         store=FakeRecoveryExperienceStore([case]),
@@ -650,9 +668,22 @@ def test_different_candidate_action_is_not_blocked_by_previous_action_limit() ->
     assert decision.executable is True
 
 
-def test_first_structured_retry_is_automatic_and_side_effect_free() -> None:
+def test_first_retryable_signal_uses_advisor_when_no_experience() -> None:
     anomaly = _anomaly(retryable_signal=True)
-    decision, store, _, _, state = _decide(anomaly=anomaly)
+    context = _run_context(external_costs_authorized=False)
+    proposal = _proposal(
+        anomaly,
+        context,
+        proposed_action=RecoveryAction.RETRY_NEW_RUN,
+        parameter_changes={},
+    )
+    advisor = FakeRecoveryAdvisor(proposal)
+
+    decision, store, _, _, state = _decide(
+        anomaly=anomaly,
+        run_context=context,
+        advisor=advisor,
+    )
 
     assert decision.action is RecoveryAction.RETRY_NEW_RUN
     assert decision.executable is True
@@ -663,23 +694,31 @@ def test_first_structured_retry_is_automatic_and_side_effect_free() -> None:
     assert decision.budget_before == state.recovery_budget_remaining
     assert decision.budget_after == state.recovery_budget_remaining - 1
     assert store.calls == 1
+    assert advisor.calls == 1
 
 
-@pytest.mark.parametrize("blocker", ["action", "cost"])
-def test_first_retry_safety_blockers_stop(blocker: str) -> None:
+def test_retryable_signal_disallowed_advisor_action_stops() -> None:
     anomaly = _anomaly(retryable_signal=True)
-    context = _run_context()
-    if blocker == "action":
-        context = _run_context(
-            allowed_recovery_actions=[RecoveryAction.RETRY_WITH_PARAMETER_CHANGE]
-        )
-    else:
-        context = _run_context(external_costs_authorized=False)
+    context = _run_context(
+        allowed_recovery_actions=[RecoveryAction.RETRY_WITH_PARAMETER_CHANGE]
+    )
+    proposal = _proposal(
+        anomaly,
+        context,
+        proposed_action=RecoveryAction.RETRY_NEW_RUN,
+        parameter_changes={},
+    )
+    advisor = FakeRecoveryAdvisor(proposal)
 
-    decision, _, _, _, _ = _decide(run_context=context, anomaly=anomaly)
+    decision, _, _, _, _ = _decide(
+        run_context=context,
+        anomaly=anomaly,
+        advisor=advisor,
+    )
 
     assert decision.action is RecoveryAction.STOP_AND_REPORT
     assert decision.executable is False
+    assert advisor.calls == 1
 
 
 def test_second_retry_does_not_use_automatic_rule() -> None:
@@ -716,6 +755,7 @@ def test_second_attempt_can_request_advisor_approval_for_a_different_action() ->
         context,
         proposed_action=RecoveryAction.RETRY_NEW_RUN,
         parameter_changes={},
+        risk_level=RiskLevel.MEDIUM,
     )
     advisor = FakeRecoveryAdvisor(proposal)
 
@@ -732,6 +772,7 @@ def test_second_attempt_can_request_advisor_approval_for_a_different_action() ->
     assert advisor.calls == 1
 
 
+@pytest.mark.parametrize("external_costs_authorized", [False, True])
 @pytest.mark.parametrize(
     ("action", "payload"),
     [
@@ -749,32 +790,63 @@ def test_second_attempt_can_request_advisor_approval_for_a_different_action() ->
         ),
     ],
 )
-def test_valid_advisor_actions_always_require_approval(
+def test_valid_low_risk_advisor_actions_are_executable_after_review(
+    external_costs_authorized: bool,
     action: RecoveryAction,
     payload: dict[str, object],
 ) -> None:
     anomaly = _anomaly()
-    context = _run_context()
+    context = _run_context(external_costs_authorized=external_costs_authorized)
     proposal = _proposal(anomaly, context, proposed_action=action, **payload)
     proposal_before = proposal.to_dict()
     advisor = FakeRecoveryAdvisor(proposal)
 
     decision, store, _, _, state = _decide(advisor=advisor, run_context=context, anomaly=anomaly)
 
-    assert decision.action is RecoveryAction.REQUEST_APPROVAL
-    assert decision.proposal_id == proposal.proposal_id
-    assert decision.proposed_action is action
-    assert decision.requires_approval is True
-    assert decision.approval_status == "pending"
-    assert decision.executable is False
+    assert decision.action is action
+    assert decision.proposal_id is None
+    assert decision.proposed_action is None
+    assert decision.requires_approval is False
+    assert decision.approval_status == "not_required"
+    assert decision.executable is True
     assert decision.new_run_required is True
-    assert decision.proposed_new_run_id is None
-    assert decision.budget_after == state.recovery_budget_remaining
+    assert decision.proposed_new_run_id
+    assert decision.budget_after == state.recovery_budget_remaining - 1
     assert decision.evidence_of_previous_success == proposal.evidence_refs
     assert proposal.to_dict() == proposal_before
     assert store.calls == 1
     assert advisor.calls == 1
     assert advisor.inputs[0][3] == []
+
+
+@pytest.mark.parametrize("risk_level", [RiskLevel.MEDIUM, RiskLevel.HIGH])
+def test_higher_risk_advisor_action_requires_approval(
+    risk_level: RiskLevel,
+) -> None:
+    anomaly = _anomaly()
+    context = _run_context(
+        approval_risk_threshold=risk_level,
+        external_costs_authorized=False,
+    )
+    proposal = _proposal(anomaly, context, risk_level=risk_level)
+    advisor = FakeRecoveryAdvisor(proposal)
+
+    decision, store, _, _, state = _decide(
+        advisor=advisor,
+        run_context=context,
+        anomaly=anomaly,
+    )
+
+    assert decision.action is RecoveryAction.REQUEST_APPROVAL
+    assert decision.proposal_id == proposal.proposal_id
+    assert decision.proposed_action is proposal.proposed_action
+    assert decision.requires_approval is True
+    assert decision.approval_status == "pending"
+    assert decision.executable is False
+    assert decision.proposed_new_run_id is None
+    assert decision.budget_after == state.recovery_budget_remaining
+    assert store.calls == 1
+    assert advisor.calls == 1
 
 
 @pytest.mark.parametrize(
@@ -951,3 +1023,93 @@ def test_fake_dependencies_structurally_connect_protocols() -> None:
     advisor: RecoveryAdvisor = FakeRecoveryAdvisor()
     assert store.search_recovery_cases(RecoveryExperienceQuery(anomaly_kind="progress_stalled", limit=1)) == []
     assert advisor.calls == 0
+
+
+def test_real_empty_recommendations_anomaly_reaches_advisor_once() -> None:
+    validation = ValidationResult(
+        validation_id="validation-controller-empty-recommendations",
+        run_id=RUN_ID,
+        created_at=NOW,
+        validated_at=NOW,
+        validated_run_dir=f"/runtime/{RUN_ID}",
+        producer="find_result_validator",
+        producer_version="1.0",
+        policy_version="find.validation.minimum.v1",
+        duration_ms=4,
+        status=ValidationStatus.BLOCK,
+        ready_for_read=False,
+        summary="Find produced no recommendations",
+        checks=[
+            ValidationCheck(
+                code="strong_recommendations_present",
+                status=ValidationStatus.BLOCK,
+                required=True,
+                message="No strong recommendations are present",
+            )
+        ],
+        passed_check_count=0,
+        warning_check_count=0,
+        blocked_check_count=1,
+        recommendation_target_count=1,
+        recommendation_actual_count=0,
+        recommendation_shortfall=1,
+        strong_recommendation_count=0,
+        recommendation_quality_status="empty",
+        candidate_ids=[],
+        candidate_digest="empty-candidates",
+        bridge_probe_status=ValidationStatus.BLOCK,
+        input_artifact_refs=[
+            ArtifactRef(
+                role="result",
+                path=f"/runtime/{RUN_ID}/find_results.json",
+                required=True,
+                exists=True,
+                parse_status="valid",
+            )
+        ],
+        bridge_probe_errors=["No recommendations are available"],
+        blockers=["No strong recommendations are present"],
+        failure_codes=["strong_recommendations_present"],
+    )
+    validation_before = validation.to_dict()
+    anomaly = FindAnomalyBuilder().build(validation_result=validation)
+    assert isinstance(anomaly, Anomaly)
+    context = _run_context()
+    state = _state(context, anomaly)
+    proposal = _proposal(
+        anomaly,
+        context,
+        proposed_action=RecoveryAction.RETRY_NEW_RUN,
+        parameter_changes={},
+    )
+    store = FakeRecoveryExperienceStore()
+    advisor = FakeRecoveryAdvisor(proposal)
+    inputs_before = deepcopy(
+        (validation.to_dict(), anomaly.to_dict(), context.to_dict(), state.to_dict())
+    )
+
+    decision, _, _, _, _ = _decide(
+        store=store,
+        advisor=advisor,
+        run_context=context,
+        anomaly=anomaly,
+        state=state,
+    )
+
+    assert anomaly.kind == "empty_recommendations"
+    assert anomaly.recovery_eligible is True
+    assert anomaly.retryable_signal is False
+    assert store.calls == 1
+    assert store.results == []
+    assert advisor.calls == 1
+    assert advisor.inputs[0][0] is anomaly
+    assert isinstance(decision, RecoveryDecision)
+    assert decision.action is RecoveryAction.RETRY_NEW_RUN
+    assert decision.executable is True
+    assert validation.to_dict() == validation_before
+    assert (
+        validation.to_dict(),
+        anomaly.to_dict(),
+        context.to_dict(),
+        state.to_dict(),
+    ) == inputs_before

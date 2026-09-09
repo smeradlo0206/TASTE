@@ -313,6 +313,90 @@ def test_observer_anomalies_map_from_structured_fields(
 
 
 @pytest.mark.parametrize(
+    ("snapshot", "expected_kind", "recovery_eligible", "retryable_signal"),
+    [
+        (
+            _progress(
+                ProgressStatus.STALLED,
+                seconds_without_progress=120.0,
+            ),
+            "progress_stalled",
+            True,
+            True,
+        ),
+        (
+            _progress(
+                ProgressStatus.FAILED,
+                process_alive=False,
+                exit_code=7,
+            ),
+            "process_exited_nonzero",
+            True,
+            True,
+        ),
+        (
+            _progress(
+                ProgressStatus.STALLED,
+                run_id="",
+                seconds_without_progress=120.0,
+            ),
+            "progress_stalled",
+            False,
+            False,
+        ),
+        (
+            _progress(
+                ProgressStatus.FAILED,
+                run_id="",
+                phase="starting",
+                process_alive=False,
+                exit_code=None,
+            ),
+            "startup_failed",
+            False,
+            False,
+        ),
+        (
+            _progress(
+                ProgressStatus.UNKNOWN,
+                progress_parse_ok=False,
+                artifact_observations=[
+                    _artifact(exists=False, parse_status="missing")
+                ],
+            ),
+            "progress_missing",
+            False,
+            False,
+        ),
+        (
+            _progress(
+                ProgressStatus.UNKNOWN,
+                progress_parse_ok=False,
+                artifact_observations=[_artifact(parse_status="invalid")],
+            ),
+            "progress_unparseable",
+            False,
+            False,
+        ),
+    ],
+)
+def test_progress_anomaly_recovery_eligibility_mapping(
+    snapshot: ProgressSnapshot,
+    expected_kind: str,
+    recovery_eligible: bool,
+    retryable_signal: bool,
+) -> None:
+    anomaly = _assert_kind(
+        FindAnomalyBuilder().build(progress_snapshot=snapshot),
+        expected_kind,
+    )
+
+    assert anomaly.recovery_eligible is recovery_eligible
+    assert anomaly.retryable_signal is retryable_signal
+    assert not anomaly.retryable_signal or anomaly.recovery_eligible
+
+
+@pytest.mark.parametrize(
     ("result", "expected_kind"),
     [
         (
@@ -357,6 +441,89 @@ def test_validator_blocks_map_from_structured_checks(
     assert anomaly.validation_id == result.validation_id
     assert anomaly.progress_snapshot_id is None
     assert anomaly.run_id == result.run_id
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_kind", "recovery_eligible", "retryable_signal"),
+    [
+        (
+            _blocked_validation("process_exit_code_ok"),
+            "process_exited_nonzero",
+            True,
+            True,
+        ),
+        (
+            _blocked_validation(
+                "reading_bridge_probe_passed",
+                recommendation_actual_count=0,
+                strong_recommendation_count=0,
+                candidate_ids=[],
+            ),
+            "empty_recommendations",
+            True,
+            False,
+        ),
+        (
+            _blocked_validation(
+                "recommendation_count_sufficient",
+                recommendation_target_count=3,
+                recommendation_actual_count=2,
+                recommendation_shortfall=1,
+            ),
+            "recommendation_shortfall",
+            True,
+            False,
+        ),
+        (
+            _blocked_validation(
+                "result_exists",
+                pass_codes=("process_exit_code_ok",),
+            ),
+            "completion_without_result",
+            False,
+            False,
+        ),
+        (_blocked_validation("result_exists"), "result_missing", False, False),
+        (
+            _blocked_validation("result_parseable"),
+            "result_unparseable",
+            False,
+            False,
+        ),
+        (
+            _blocked_validation("result_run_id_matches"),
+            "run_id_mismatch",
+            False,
+            False,
+        ),
+        (
+            _blocked_validation("source_integrity_not_blocking"),
+            "source_integrity_blocked",
+            False,
+            False,
+        ),
+        (
+            _blocked_validation("reading_candidate_ids_unique"),
+            "reading_bridge_rejected",
+            False,
+            False,
+        ),
+    ],
+)
+def test_validation_anomaly_recovery_eligibility_mapping(
+    result: ValidationResult,
+    expected_kind: str,
+    recovery_eligible: bool,
+    retryable_signal: bool,
+) -> None:
+    anomaly = _assert_kind(
+        FindAnomalyBuilder().build(validation_result=result),
+        expected_kind,
+    )
+
+    assert anomaly.recovery_eligible is recovery_eligible
+    assert anomaly.retryable_signal is retryable_signal
+    assert not anomaly.retryable_signal or anomaly.recovery_eligible
 
 
 def test_successful_completion_without_result_has_specific_kind() -> None:

@@ -449,6 +449,9 @@ import json
 import os
 import shutil
 import sys
+import time
+from copy import deepcopy
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -470,18 +473,30 @@ from orchestration.run_frontend import (
 from project.project_paths import build_paths, load_project_config
 from bridges.reading_bridge import update_project_read_default_after_find
 from bridges.sync_outputs import adopt_taste_find_run
+from contracts.web_models import AppConfig
+from integrations.web_llm import LLMClient
 from feedback import (
     FeedbackSupervisor,
     FindFeedbackAdapter,
     FindAnomalyBuilder,
+    FindRecoveryApprovalGate,
     FindRecoveryController,
     FindResultValidator,
     FileProgressObserver,
+    ExecutionHandle,
     JsonExperienceStore,
+    LLMRecoveryAdvisor,
+    RecoveryAction,
+    RecoveryDecision,
+    RunContext,
     SupervisorState,
     SupervisorStatus,
     build_experience_query,
     build_find_stage_request,
+)
+from feedback.feedback_adapter import (
+    _SAFE_INTEGER_PARAMETERS,
+    _sync_runtime_tuning,
 )
 
 DEFAULT_CORE_VENUE_IDS = {core_venue_ids_json}
@@ -500,6 +515,7 @@ force_new_find = {force_new_find}
 restart_full_cycle = {restart_full_cycle}
 human_approved_new_find = {human_approved_new_find}
 approval_reason = {approval_reason_json}
+web_job_id = {web_job_id_json}
 paths = build_paths(project)
 internal_output_dir_raw = os.environ.get("TASTE_INTERNAL_FIND_OUTPUT_DIR", "").strip()
 internal_output_dir = Path(internal_output_dir_raw).expanduser() if internal_output_dir_raw else None
@@ -850,6 +866,303 @@ runtime_find_config = {{
 }}
 write_json_file(find_config_path, runtime_find_config)
 
+_RECOVERY_APPROVAL_WAIT_SECONDS = 900.0
+
+def _recovery_approval_paths():
+    if request_source != "web" or not web_job_id:
+        return None
+    if (
+        Path(web_job_id).name != web_job_id
+        or web_job_id in {{".", ".."}}
+        or not all(character.isalnum() or character in "_.-" for character in web_job_id)
+    ):
+        raise ValueError("Web job ID is not safe for recovery approval")
+    project_root = paths.root.resolve()
+    control_root = (project_root / "tmp" / "feedback_recovery").resolve()
+    if project_root not in control_root.parents:
+        raise ValueError("Recovery approval path is outside the project")
+    control_dir = (control_root / web_job_id).resolve()
+    if control_dir.parent != control_root:
+        raise ValueError("Recovery approval path is outside the control directory")
+    return control_dir / "pending.json", control_dir / "resolution.json"
+
+def _atomic_write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name("." + path.name + "." + str(os.getpid()) + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+def _cleanup_recovery_approval_files():
+    approval_paths = _recovery_approval_paths()
+    if approval_paths is None:
+        return
+    pending_path, resolution_path = approval_paths
+    pending_path.unlink(missing_ok=True)
+    resolution_path.unlink(missing_ok=True)
+    try:
+        pending_path.parent.rmdir()
+    except OSError:
+        pass
+
+def _pending_recovery_summary(decision):
+    return {{
+        "decision_id": decision.decision_id,
+        "run_id": decision.run_id,
+        "anomaly_id": decision.anomaly_id,
+        "proposed_action": decision.proposed_action.value,
+        "risk_level": decision.risk_level.value,
+        "reason": decision.reason,
+        "parameter_changes": [change.to_dict() for change in decision.parameter_changes],
+        "target_sources": list(decision.target_sources),
+        "approval_status": decision.approval_status,
+    }}
+
+def _wait_for_recovery_resolution(decision):
+    approval_paths = _recovery_approval_paths()
+    if approval_paths is None:
+        print(
+            "[framework] Pending recovery requires an active Web job; recovery was not executed",
+            flush=True,
+        )
+        return None
+    pending_path, resolution_path = approval_paths
+    _atomic_write_json(pending_path, _pending_recovery_summary(decision))
+    print(
+        "TASTE_FEEDBACK_RECOVERY "
+        + json.dumps(
+            {{"status": "awaiting_approval", "decision_id": decision.decision_id}},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+    deadline = time.monotonic() + _RECOVERY_APPROVAL_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if not resolution_path.is_file():
+            time.sleep(0.25)
+            continue
+        try:
+            resolution = json.loads(resolution_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError("Recovery approval resolution is invalid") from error
+        required_fields = {{
+            "decision_id",
+            "approved",
+            "approved_by",
+            "reason",
+            "resolved_at",
+        }}
+        if not isinstance(resolution, dict) or set(resolution) != required_fields:
+            raise RuntimeError("Recovery approval resolution is invalid")
+        if resolution.get("decision_id") != decision.decision_id:
+            raise RuntimeError("Recovery approval decision identity does not match")
+        if type(resolution.get("approved")) is not bool:
+            raise RuntimeError("Recovery approval choice is invalid")
+        if not isinstance(resolution.get("approved_by"), str) or not isinstance(
+            resolution.get("reason"), str
+        ):
+            raise RuntimeError("Recovery approval metadata is invalid")
+        return resolution
+    raise RuntimeError("Recovery approval timed out")
+
+_executed_recovery_decision_ids = set()
+
+def _execute_approved_recovery_decision(
+    *,
+    decision: RecoveryDecision,
+    run_context: RunContext,
+) -> ExecutionHandle:
+    if not isinstance(decision, RecoveryDecision):
+        raise TypeError("decision must be a RecoveryDecision")
+    if not isinstance(run_context, RunContext):
+        raise TypeError("run_context must be a RunContext")
+
+    validated_decision = RecoveryDecision.from_json(decision.to_json())
+    validated_context = RunContext.from_json(run_context.to_json())
+    if validated_decision.decision_id in _executed_recovery_decision_ids:
+        raise RuntimeError("RecoveryDecision has already been executed")
+    if not validated_decision.executable:
+        raise ValueError("RecoveryDecision must be executable")
+    if validated_decision.approval_status not in {{"not_required", "approved"}}:
+        raise ValueError("RecoveryDecision approval status is not executable")
+
+    if validated_decision.approval_status == "approved":
+        if (
+            validated_decision.action is not RecoveryAction.REQUEST_APPROVAL
+            or validated_decision.proposed_action is None
+        ):
+            raise ValueError("approved RecoveryDecision has no proposed action")
+        recovery_action = validated_decision.proposed_action
+    else:
+        if (
+            validated_decision.action is RecoveryAction.REQUEST_APPROVAL
+            or validated_decision.proposed_action is not None
+        ):
+            raise ValueError("not_required RecoveryDecision has invalid action data")
+        recovery_action = validated_decision.action
+
+    if recovery_action is RecoveryAction.SKIP_OPTIONAL_SOURCE:
+        raise ValueError("skip_optional_source recovery is not supported")
+    executable_actions = {{
+        RecoveryAction.RETRY_NEW_RUN,
+        RecoveryAction.RETRY_WITH_PARAMETER_CHANGE,
+    }}
+    if recovery_action not in executable_actions:
+        raise ValueError("RecoveryDecision action is not executable")
+    if recovery_action not in validated_context.allowed_recovery_actions:
+        raise ValueError("RecoveryDecision action is not allowed by RunContext")
+    if not validated_decision.new_run_required:
+        raise ValueError("RecoveryDecision must require a new run")
+    if not validated_decision.proposed_new_run_id:
+        raise ValueError("RecoveryDecision must provide a new run ID")
+    if validated_decision.attempt_index != validated_context.attempt_index + 1:
+        raise ValueError("RecoveryDecision attempt index is stale")
+
+    proposed_new_run_id = validated_decision.proposed_new_run_id
+    if (
+        Path(proposed_new_run_id).name != proposed_new_run_id
+        or proposed_new_run_id in {{".", ".."}}
+    ):
+        raise ValueError("RecoveryDecision new run ID is not path-safe")
+
+    effective_parameters = deepcopy(dict(validated_context.effective_parameters))
+    decision_changes = deepcopy(validated_decision.parameter_changes)
+    if recovery_action is RecoveryAction.RETRY_NEW_RUN:
+        if decision_changes or validated_decision.target_sources:
+            raise ValueError("retry_new_run must not carry recovery payload")
+    else:
+        if not decision_changes or validated_decision.target_sources:
+            raise ValueError("retry_with_parameter_change has invalid payload")
+        changed_names = set()
+        for change in decision_changes:
+            if change.name in changed_names:
+                raise ValueError("RecoveryDecision repeats a parameter change")
+            if change.name not in _SAFE_INTEGER_PARAMETERS:
+                raise ValueError("RecoveryDecision contains a non-whitelisted parameter")
+            if change.name not in effective_parameters:
+                raise ValueError("RecoveryDecision parameter is absent from RunContext")
+            current_value = effective_parameters[change.name]
+            if change.before is not None and change.before != current_value:
+                raise ValueError("RecoveryDecision parameter before value is stale")
+            if type(change.after) is not int or change.after <= 0:
+                raise ValueError("RecoveryDecision parameter after value is invalid")
+            effective_parameters[change.name] = change.after
+            _sync_runtime_tuning(
+                effective_parameters,
+                change.name,
+                change.after,
+            )
+            changed_names.add(change.name)
+
+    def read_required_json_object(snapshot_path, snapshot_name):
+        try:
+            payload = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                "Recovery run " + snapshot_name + " snapshot is unavailable"
+            ) from error
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                "Recovery run " + snapshot_name + " snapshot must be an object"
+            )
+        return payload
+
+    input_payload = read_required_json_object(
+        validated_context.input_snapshot_path,
+        "input",
+    )
+    selection_payload = read_required_json_object(
+        validated_context.selection_snapshot_path,
+        "selection",
+    )
+    if selection_payload != dict(validated_context.selection):
+        raise ValueError("RunContext selection does not match its snapshot")
+
+    recovery_input_dir = (
+        Path(validated_context.config_snapshot_path).parent
+        / "recovery"
+        / proposed_new_run_id
+    )
+    recovery_input_dir.mkdir(parents=True, exist_ok=False)
+    recovery_config_path = recovery_input_dir / "find.config.json"
+    recovery_input_path = recovery_input_dir / "input.json"
+    recovery_selection_path = recovery_input_dir / "selection.json"
+    write_json_file(
+        recovery_config_path,
+        {{
+            "schema_version": 1,
+            "config": effective_parameters,
+            "selection": selection_payload,
+        }},
+    )
+    write_json_file(recovery_input_path, input_payload)
+    write_json_file(recovery_selection_path, selection_payload)
+
+    recovery_run_context = replace(
+        validated_context,
+        attempt_index=validated_context.attempt_index + 1,
+        created_at=datetime.now(timezone.utc),
+        selection_snapshot_path=str(recovery_selection_path),
+        selection=deepcopy(selection_payload),
+        command_redacted=[
+            validated_context.python_executable,
+            validated_context.entrypoint,
+            "--action",
+            validated_context.action,
+            "--config-json",
+            str(recovery_config_path),
+            "--input-json",
+            str(recovery_input_path),
+        ],
+        config_snapshot_path=str(recovery_config_path),
+        input_snapshot_path=str(recovery_input_path),
+        effective_parameters=deepcopy(effective_parameters),
+        parameter_changes=deepcopy(
+            list(validated_context.parameter_changes) + decision_changes
+        ),
+    )
+    _executed_recovery_decision_ids.add(validated_decision.decision_id)
+    recovery_supervisor = _build_recovery_supervisor(
+        decision=validated_decision,
+        recovery_run_context=recovery_run_context,
+    )
+    execution_handle, _ = _run_supervised_find_attempt(
+        attempt_run_context=recovery_run_context,
+        attempt_supervisor=recovery_supervisor,
+    )
+    if execution_handle.exit_code != 0:
+        raise RuntimeError("Recovery Find process failed")
+    if recovery_supervisor.trace_summary["validation_status"] != "pass":
+        raise RuntimeError("Recovery Find result validation failed")
+    return execution_handle
+
+recovery_advisor = None
+try:
+    recovery_llm_payload = dict(local_llm)
+    recovery_llm_payload.update(
+        {{
+            "provider": provider,
+            "base_url": api_base,
+            "api_key": api_key,
+            "model": model,
+            "temperature": config_payload["temperature"],
+        }}
+    )
+    recovery_llm_config = AppConfig(**recovery_llm_payload)
+    recovery_llm_client = LLMClient(recovery_llm_config, role="find")
+    if recovery_llm_client.enabled:
+        recovery_advisor = LLMRecoveryAdvisor(llm_client=recovery_llm_client)
+except Exception:
+    recovery_advisor = None
+    print("[framework] Recovery Advisor unavailable", flush=True)
+
 supervisor_now = datetime.now(timezone.utc)
 initial_supervisor_state = SupervisorState(
     supervisor_id="supervisor-" + run_context.context_id,
@@ -876,15 +1189,21 @@ initial_supervisor_state = SupervisorState(
     state_path=str(input_dir / "feedback-supervisor-state.json"),
     run_context_id=run_context.context_id,
 )
+feedback_observer = FileProgressObserver()
+feedback_validator = FindResultValidator()
+feedback_anomaly_builder = FindAnomalyBuilder()
+feedback_recovery_controller = FindRecoveryController(
+    experience_store=experience_store,
+    recovery_advisor=recovery_advisor,
+)
+feedback_approval_gate = FindRecoveryApprovalGate()
 supervisor = FeedbackSupervisor(
-    observer=FileProgressObserver(),
-    result_validator=FindResultValidator(),
-    anomaly_builder=FindAnomalyBuilder(),
-    recovery_controller=FindRecoveryController(
-        experience_store=experience_store,
-        recovery_advisor=None,
-    ),
+    observer=feedback_observer,
+    result_validator=feedback_validator,
+    anomaly_builder=feedback_anomaly_builder,
+    recovery_controller=feedback_recovery_controller,
     initial_state=initial_supervisor_state,
+    approval_gate=feedback_approval_gate,
 )
 feedback_decisions = []
 feedback_monitor_started_logged = False
@@ -935,82 +1254,196 @@ def _emit_feedback_summary_once():
     except Exception:
         _report_feedback_trace_failure()
 
-def _on_feedback_monitor_tick(handle):
-    decision = supervisor.on_monitor_tick(
-        run_context=run_context,
-        execution_handle=handle,
-    )
-    _emit_feedback_monitor_started_once()
-    if decision is not None:
-        feedback_decisions.append(decision)
-
 find_runtime_dir = Path(
     os.environ.get("FINDING_RUNTIME_DIR") or finding_module / ".runtime"
 ).expanduser()
-binding_parser = _FindRunBindingParser(find_runtime_dir / "runs")
 
-def _emit_find_log(text):
-    try:
-        binding_rejected = binding_parser.consume(
-            text,
-            execution_handle=execution_handle,
+def _run_supervised_find_attempt(*, attempt_run_context, attempt_supervisor):
+    binding_parser = _FindRunBindingParser(find_runtime_dir / "runs")
+    terminal_feedback_called = False
+
+    def emit_find_log(text):
+        try:
+            binding_rejected = binding_parser.consume(
+                text,
+                execution_handle=execution_handle,
+            )
+        except Exception:
+            binding_rejected = True
+        if binding_rejected:
+            print("[framework] Find run binding event rejected", flush=True)
+        print(text, end="", flush=True)
+
+    def on_feedback_monitor_tick(handle):
+        decision = attempt_supervisor.on_monitor_tick(
+            run_context=attempt_run_context,
+            execution_handle=handle,
         )
-    except Exception:
-        binding_rejected = True
-    if binding_rejected:
-        print("[framework] Find run binding event rejected", flush=True)
-    print(text, end="", flush=True)
+        if attempt_supervisor is supervisor:
+            _emit_feedback_monitor_started_once()
+        if decision is not None:
+            feedback_decisions.append(decision)
+
+    def notify_feedback_process_exited():
+        try:
+            decision = attempt_supervisor.on_process_exited(
+                run_context=attempt_run_context,
+                execution_handle=execution_handle,
+            )
+        except RuntimeError:
+            decision = None
+            print("[framework] Feedback Supervisor terminal call failed", flush=True)
+        if decision is not None:
+            feedback_decisions.append(decision)
+
+    executor, execution_handle, process = _start_find_with_executor(attempt_run_context)
+    _register_find_process_exit_cleanup(process)
+    stdout_output = _consume_execution_logs(
+        process,
+        execution_handle,
+        emit_find_log,
+        on_monitor_tick=on_feedback_monitor_tick,
+    )
+    returncode = execution_handle.exit_code
+
+    if execution_handle.run_id and execution_handle.run_dir:
+        notify_feedback_process_exited()
+        terminal_feedback_called = True
+        if attempt_supervisor is supervisor:
+            _emit_feedback_summary_once()
+
+    if returncode == 0:
+        run_id, directory, _ = _parse_find_cli_result(
+            stdout_output,
+            finding_module,
+        )
+        if execution_handle.run_id and execution_handle.run_dir:
+            if (
+                execution_handle.run_id != run_id
+                or Path(execution_handle.run_dir).resolve() != directory.resolve()
+            ):
+                raise RuntimeError(
+                    "Finding CLI run identity conflicts with the bound Find run"
+                )
+        else:
+            execution_handle.run_id = run_id
+            execution_handle.run_dir = str(directory)
+    elif not terminal_feedback_called:
+        print("[framework] Find exited before run identity was bound", flush=True)
+        if attempt_supervisor is supervisor:
+            _emit_feedback_summary_once()
+
+    if execution_handle.run_id and not terminal_feedback_called:
+        notify_feedback_process_exited()
+        if attempt_supervisor is supervisor:
+            _emit_feedback_summary_once()
+    return execution_handle, stdout_output
+
+def _build_recovery_supervisor(*, decision, recovery_run_context):
+    parent_state = supervisor.state
+    now = datetime.now(timezone.utc)
+    recovery_state = replace(
+        parent_state,
+        supervisor_id=parent_state.supervisor_id + "-recovery-" + str(decision.attempt_index),
+        status=SupervisorStatus.RECOVERING,
+        state_revision=parent_state.state_revision + 1,
+        updated_at=now,
+        heartbeat_at=now,
+        process_alive=False,
+        recovery_attempts=parent_state.recovery_attempts + 1,
+        recovery_budget_remaining=decision.budget_after,
+        awaiting_approval=False,
+        gate_evaluated=False,
+        allow_read=False,
+        gate_reason="Validating one bounded recovery Find",
+        terminal=False,
+        final_status=None,
+        run_context_id=recovery_run_context.context_id,
+        active_run_id=None,
+        latest_progress_snapshot_id=None,
+        latest_validation_id=None,
+        pending_approval_decision_id=None,
+        active_pid=None,
+        process_started_at=None,
+        exit_code=None,
+        gate_validation_id=None,
+        terminal_reason=None,
+        last_error=None,
+    )
+    return FeedbackSupervisor(
+        observer=feedback_observer,
+        result_validator=feedback_validator,
+        anomaly_builder=feedback_anomaly_builder,
+        recovery_controller=feedback_recovery_controller,
+        initial_state=recovery_state,
+        approval_gate=feedback_approval_gate,
+    )
+
+def _consume_recovery_decision(*, decision, run_context, supervisor):
+    if decision is None:
+        return None
+    if decision.action in {{RecoveryAction.NO_ACTION, RecoveryAction.STOP_AND_REPORT}}:
+        return None
+    resolved = decision
+    if decision.approval_status == "pending":
+        if not decision.requires_approval or decision.executable:
+            raise RuntimeError("Pending RecoveryDecision state is invalid")
+        try:
+            resolution = _wait_for_recovery_resolution(decision)
+            if resolution is None:
+                return None
+            resolved = supervisor.resolve_recovery_approval(
+                decision_id=resolution["decision_id"],
+                approved=resolution["approved"],
+                approved_by=resolution["approved_by"] or None,
+                reason=resolution["reason"],
+            )
+        finally:
+            _cleanup_recovery_approval_files()
+    if resolved.approval_status == "rejected":
+        return None
+    if resolved.approval_status not in {{"not_required", "approved"}}:
+        raise RuntimeError("RecoveryDecision approval state is invalid")
+    if not resolved.executable:
+        raise RuntimeError("RecoveryDecision is not executable")
+    return _execute_approved_recovery_decision(
+        decision=resolved,
+        run_context=run_context,
+    )
 
 print("[framework] Finding public CLI input: " + str(find_config_path) + " / " + str(input_path), flush=True)
-executor, execution_handle, process = _start_find_with_executor(run_context)
-_register_find_process_exit_cleanup(process)
-stdout_output = _consume_execution_logs(
-    process,
-    execution_handle,
-    _emit_find_log,
-    on_monitor_tick=_on_feedback_monitor_tick,
+initial_decision_count = len(feedback_decisions)
+execution_handle, stdout_output = _run_supervised_find_attempt(
+    attempt_run_context=run_context,
+    attempt_supervisor=supervisor,
 )
+decision = (
+    feedback_decisions[initial_decision_count]
+    if len(feedback_decisions) > initial_decision_count
+    else None
+)
+recovery_execution_handle = _consume_recovery_decision(
+    decision=decision,
+    run_context=run_context,
+    supervisor=supervisor,
+)
+if recovery_execution_handle is not None:
+    execution_handle = recovery_execution_handle
+    stdout_output = Path(execution_handle.stdout_path).read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
+
 returncode = execution_handle.exit_code
-terminal_feedback_called = False
-
-def _notify_feedback_process_exited():
-    try:
-        decision = supervisor.on_process_exited(
-            run_context=run_context,
-            execution_handle=execution_handle,
-        )
-    except RuntimeError:
-        decision = None
-        print("[framework] Feedback Supervisor terminal call failed", flush=True)
-    if decision is not None:
-        feedback_decisions.append(decision)
-
-if execution_handle.run_id and execution_handle.run_dir:
-    _notify_feedback_process_exited()
-    terminal_feedback_called = True
-    _emit_feedback_summary_once()
-
 if returncode != 0:
-    if not terminal_feedback_called:
-        print("[framework] Find exited before run identity was bound", flush=True)
-        _emit_feedback_summary_once()
     raise SystemExit(returncode)
-
 run_id, directory, result = _parse_find_cli_result(stdout_output, finding_module)
-if execution_handle.run_id and execution_handle.run_dir:
-    if (
-        execution_handle.run_id != run_id
-        or Path(execution_handle.run_dir).resolve() != directory.resolve()
-    ):
-        raise RuntimeError("Finding CLI run identity conflicts with the bound Find run")
-else:
-    execution_handle.run_id = run_id
-    execution_handle.run_dir = str(directory)
-
-if not terminal_feedback_called:
-    _notify_feedback_process_exited()
-    terminal_feedback_called = True
-    _emit_feedback_summary_once()
+if (
+    execution_handle.run_id != run_id
+    or not execution_handle.run_dir
+    or Path(execution_handle.run_dir).resolve() != directory.resolve()
+):
+    raise RuntimeError("Finding CLI run identity conflicts with the bound Find run")
 out_dir = internal_output_dir if internal_output_dir is not None else paths.planning / "finding"
 out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1416,7 +1849,7 @@ def merge_extra_queries(args: argparse.Namespace) -> list[str]:
     return merged
 
 
-def write_driver(path: Path, project: str, max_papers: int, max_ideas: int, repair_rounds: int, include_arxiv: bool, include_huggingface: bool, include_github: bool, use_venues: bool, source_selection: dict[str, Any], *, request_source: str = "cli", force_new_find: bool = False, restart_full_cycle: bool = False, human_approved_new_find: bool = False, approval_reason: str = "", deep_survey: bool = False, fast_mode: bool = False) -> None:
+def write_driver(path: Path, project: str, max_papers: int, max_ideas: int, repair_rounds: int, include_arxiv: bool, include_huggingface: bool, include_github: bool, use_venues: bool, source_selection: dict[str, Any], *, request_source: str = "cli", force_new_find: bool = False, restart_full_cycle: bool = False, human_approved_new_find: bool = False, approval_reason: str = "", web_job_id: str = "", deep_survey: bool = False, fast_mode: bool = False) -> None:
     code = DRIVER_TEMPLATE.format(
         root_json=json.dumps(str(ROOT)),
         taste_root_json=json.dumps(str(ROOT)),
@@ -1435,11 +1868,41 @@ def write_driver(path: Path, project: str, max_papers: int, max_ideas: int, repa
         restart_full_cycle=bool(restart_full_cycle),
         human_approved_new_find=bool(human_approved_new_find),
         approval_reason_json=json.dumps(approval_reason),
+        web_job_id_json=json.dumps(web_job_id),
         core_venue_ids_json=json.dumps(DEFAULT_CORE_VENUE_IDS),
         deep_survey=bool(deep_survey),
         fast_mode=bool(fast_mode),
     )
     path.write_text(code, encoding="utf-8")
+
+
+def _cleanup_recovery_approval_control_files(
+    project_root: Path,
+    web_job_id: str,
+) -> None:
+    job_id = str(web_job_id or "").strip()
+    if (
+        not job_id
+        or Path(job_id).name != job_id
+        or job_id in {".", ".."}
+        or not all(character.isalnum() or character in "_.-" for character in job_id)
+    ):
+        return
+    resolved_project_root = Path(project_root).resolve()
+    control_root = (
+        resolved_project_root / "tmp" / "feedback_recovery"
+    ).resolve()
+    if resolved_project_root not in control_root.parents:
+        return
+    control_dir = (control_root / job_id).resolve()
+    if control_dir.parent != control_root:
+        return
+    for name in ("pending.json", "resolution.json"):
+        (control_dir / name).unlink(missing_ok=True)
+    try:
+        control_dir.rmdir()
+    except OSError:
+        pass
 
 
 def redact(text: str) -> str:
@@ -1822,6 +2285,7 @@ def main() -> int:
         restart_full_cycle=bool(args.restart_full_cycle),
         human_approved_new_find=bool(args.human_approved_new_find),
         approval_reason=str(args.approval_reason or "").strip(),
+        web_job_id=str(args.web_job_id or "").strip(),
         deep_survey=bool(args.deep_survey),
         fast_mode=bool(args.fast_mode),
     )
@@ -1924,6 +2388,8 @@ def main() -> int:
             print(json.dumps(payload, ensure_ascii=False))
             print(f"native frontend timed out after {args.timeout_sec}s before usable Find; no fallback artifacts were written.", file=sys.stderr)
             return 124
+    finally:
+        _cleanup_recovery_approval_control_files(paths.root, args.web_job_id)
     log_path.write_text(redact(proc.stdout) + "\n--- STDERR ---\n" + redact(proc.stderr), encoding="utf-8")
     try:
         driver.unlink()

@@ -13,6 +13,7 @@ from feedback import (
     EvidenceRef,
     ExecutionHandle,
     ExperienceQuery,
+    FindRecoveryApprovalGate,
     ProgressSnapshot,
     ProgressStatus,
     RecoveryAction,
@@ -211,6 +212,56 @@ def _decision(anomaly: Anomaly, action: RecoveryAction = RecoveryAction.STOP_AND
     )
 
 
+def _pending_decision(anomaly: Anomaly) -> RecoveryDecision:
+    return RecoveryDecision(
+        decision_id=f"decision-pending-{anomaly.anomaly_id}",
+        run_id=anomaly.run_id,
+        anomaly_id=anomaly.anomaly_id,
+        created_at=NOW,
+        decided_at=NOW,
+        producer="fake-controller",
+        producer_version="1.0",
+        action=RecoveryAction.REQUEST_APPROVAL,
+        reason="Synthetic approval is required",
+        risk_level=RiskLevel.MEDIUM,
+        executable=False,
+        new_run_required=True,
+        exploratory=False,
+        requires_approval=True,
+        approval_status="pending",
+        attempt_index=1,
+        budget_before=1,
+        budget_cost=0,
+        budget_after=1,
+        max_same_action_attempts=1,
+        verification_policy="find.validation.v1",
+        required_post_checks=["result_exists"],
+        success_definition="A new Find run passes validation",
+        stop_if_failed=True,
+        proposal_id="proposal-supervisor-001",
+        proposed_action=RecoveryAction.RETRY_NEW_RUN,
+    )
+
+
+def _automatic_decision(anomaly: Anomaly) -> RecoveryDecision:
+    decision = _pending_decision(anomaly)
+    return RecoveryDecision.from_dict(
+        {
+            **decision.to_dict(),
+            "action": RecoveryAction.RETRY_NEW_RUN.value,
+            "risk_level": RiskLevel.LOW.value,
+            "executable": True,
+            "requires_approval": False,
+            "approval_status": "not_required",
+            "budget_cost": 1,
+            "budget_after": 0,
+            "proposal_id": None,
+            "proposed_action": None,
+            "proposed_new_run_id": "find-recovery-supervisor-001",
+        }
+    )
+
+
 def _state(**overrides: object) -> SupervisorState:
     values: dict[str, object] = {
         "supervisor_id": "supervisor-001",
@@ -310,6 +361,32 @@ class FakeController:
         return result  # type: ignore[return-value]
 
 
+class RecordingApprovalGate:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[
+            tuple[RecoveryDecision, bool | None, str | None, str | None]
+        ] = []
+
+    def resolve(
+        self,
+        *,
+        decision: RecoveryDecision,
+        approved: bool | None = None,
+        approved_by: str | None = None,
+        reason: str | None = None,
+    ) -> RecoveryDecision:
+        self.calls.append((decision, approved, approved_by, reason))
+        if self.error is not None:
+            raise self.error
+        return FindRecoveryApprovalGate().resolve(
+            decision=decision,
+            approved=approved,
+            approved_by=approved_by,
+            reason=reason,
+        )
+
+
 def _supervisor(
     *,
     snapshots: list[object] | None = None,
@@ -317,6 +394,7 @@ def _supervisor(
     anomalies: list[object] | None = None,
     decisions: list[object] | None = None,
     initial_state: SupervisorState | None = None,
+    approval_gate: object | None = None,
 ) -> tuple[FeedbackSupervisor, FakeObserver, FakeValidator, FakeAnomalyBuilder, FakeController]:
     observer = FakeObserver([_snapshot()] if snapshots is None else snapshots)
     validator = FakeValidator(_validation() if validation is None else validation)
@@ -328,6 +406,7 @@ def _supervisor(
         anomaly_builder=builder,
         recovery_controller=controller,
         initial_state=_state() if initial_state is None else initial_state,
+        approval_gate=approval_gate,
     )
     return supervisor, observer, validator, builder, controller
 
@@ -344,6 +423,18 @@ def test_public_api_and_entrypoint_signatures() -> None:
     assert monitor.parameters["cancel_requested"].default is False
     exited = inspect.signature(FeedbackSupervisor.on_process_exited)
     assert list(exited.parameters) == ["self", "run_context", "execution_handle"]
+    resolve = inspect.signature(FeedbackSupervisor.resolve_recovery_approval)
+    assert list(resolve.parameters) == [
+        "self",
+        "decision_id",
+        "approved",
+        "approved_by",
+        "reason",
+    ]
+    assert all(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        for parameter in list(resolve.parameters.values())[1:]
+    )
 
 
 def test_monitor_tick_passes_previous_snapshot_and_cancel_without_validating_or_deciding() -> None:
@@ -481,6 +572,263 @@ def test_process_exited_validates_then_builds_matching_evidence_and_decides_once
     assert passed_state.active_run_id == RUN_ID
     assert passed_state.active_anomaly_id == anomaly.anomaly_id
     assert supervisor.state.active_recovery_decision_id == decision.decision_id
+
+
+def test_first_process_exit_establishes_root_run_id() -> None:
+    supervisor, _, validator, _, _ = _supervisor(
+        validation=_validation(),
+        anomalies=[None],
+    )
+    handle = _handle(bound=True, alive=False)
+
+    assert supervisor.state.root_run_id is None
+    assert supervisor.on_process_exited(
+        run_context=_run_context(),
+        execution_handle=handle,
+    ) is None
+
+    assert supervisor.state.root_run_id == RUN_ID
+    assert supervisor.state.active_run_id == RUN_ID
+    assert validator.calls == [handle]
+
+
+def test_recovery_process_exit_preserves_root_and_validates_active_run() -> None:
+    root_run_id = "find-supervisor-root-001"
+    recovery_run_id = "find-supervisor-recovery-001"
+    recovery_state = _state(
+        root_run_id=root_run_id,
+        status=SupervisorStatus.RECOVERING,
+        recovery_attempts=1,
+        recovery_budget_remaining=0,
+        active_anomaly_id="anomaly-supervisor-root-001",
+        active_recovery_decision_id="decision-supervisor-root-001",
+    )
+    supervisor, _, validator, _, _ = _supervisor(
+        validation=_validation(run_id=recovery_run_id),
+        anomalies=[None],
+        initial_state=recovery_state,
+    )
+    handle = _handle(
+        bound=True,
+        alive=False,
+        run_id=recovery_run_id,
+        run_dir=f"/tmp/{recovery_run_id}",
+    )
+
+    assert supervisor.on_process_exited(
+        run_context=_run_context(),
+        execution_handle=handle,
+    ) is None
+
+    assert supervisor.state.root_run_id == root_run_id
+    assert supervisor.state.active_run_id == recovery_run_id
+    assert validator.calls == [handle]
+    assert validator.calls[0].run_id == recovery_run_id
+    assert supervisor.trace_summary["validation_status"] == "pass"
+
+
+def test_pending_decision_is_saved_as_an_isolated_copy_and_updates_state() -> None:
+    anomaly = _anomaly()
+    decision = _pending_decision(anomaly)
+    supervisor, *_ = _supervisor(
+        validation=_validation(status=ValidationStatus.BLOCK),
+        anomalies=[anomaly],
+        decisions=[decision],
+    )
+
+    result = supervisor.on_process_exited(
+        run_context=_run_context(),
+        execution_handle=_handle(bound=True, alive=False),
+    )
+    first = supervisor.pending_decision
+
+    assert result == decision
+    assert first == decision
+    assert first is not decision
+    first.required_post_checks.append("caller-mutation")
+    assert supervisor.pending_decision.required_post_checks == ["result_exists"]
+    assert supervisor.state.status is SupervisorStatus.AWAITING_APPROVAL
+    assert supervisor.state.awaiting_approval is True
+    assert supervisor.state.active_recovery_decision_id == decision.decision_id
+    assert supervisor.state.pending_approval_decision_id == decision.decision_id
+    assert supervisor.state.recovery_attempts == 0
+    assert supervisor.state.recovery_budget_remaining == 1
+
+
+def test_pending_decision_can_be_approved_once_without_mutating_controller_output() -> None:
+    anomaly = _anomaly()
+    decision = _pending_decision(anomaly)
+    decision_before = decision.to_json()
+    gate = RecordingApprovalGate()
+    supervisor, *_ = _supervisor(
+        validation=_validation(status=ValidationStatus.BLOCK),
+        anomalies=[anomaly],
+        decisions=[decision],
+        approval_gate=gate,
+    )
+    supervisor.on_process_exited(
+        run_context=_run_context(),
+        execution_handle=_handle(bound=True, alive=False),
+    )
+
+    resolved = supervisor.resolve_recovery_approval(
+        decision_id=decision.decision_id,
+        approved=True,
+        approved_by="reviewer-001",
+        reason="Approve the bounded retry",
+    )
+
+    assert resolved.approval_status == "approved"
+    assert resolved.executable is True
+    assert resolved.budget_after == 0
+    assert resolved is not gate.calls[0][0]
+    assert gate.calls[0][0] is not decision
+    assert decision.to_json() == decision_before
+    assert supervisor.pending_decision is None
+    assert supervisor.state.status is SupervisorStatus.DECIDING
+    assert supervisor.state.awaiting_approval is False
+    assert supervisor.state.active_recovery_decision_id == decision.decision_id
+    assert supervisor.state.pending_approval_decision_id is None
+    assert supervisor.state.recovery_budget_remaining == resolved.budget_after
+    assert supervisor.state.recovery_attempts == 0
+    with pytest.raises(ValueError, match="pending"):
+        supervisor.resolve_recovery_approval(
+            decision_id=decision.decision_id,
+            approved=True,
+            approved_by="reviewer-001",
+            reason="Resolve twice",
+        )
+    assert len(gate.calls) == 1
+
+
+def test_pending_decision_can_be_rejected_once_without_spending_budget() -> None:
+    anomaly = _anomaly()
+    decision = _pending_decision(anomaly)
+    gate = RecordingApprovalGate()
+    supervisor, *_ = _supervisor(
+        validation=_validation(status=ValidationStatus.BLOCK),
+        anomalies=[anomaly],
+        decisions=[decision],
+        approval_gate=gate,
+    )
+    supervisor.on_process_exited(
+        run_context=_run_context(),
+        execution_handle=_handle(bound=True, alive=False),
+    )
+
+    resolved = supervisor.resolve_recovery_approval(
+        decision_id=decision.decision_id,
+        approved=False,
+        reason="Reject the retry",
+    )
+
+    assert resolved.approval_status == "rejected"
+    assert resolved.executable is False
+    assert resolved.budget_after == decision.budget_before
+    assert supervisor.pending_decision is None
+    assert supervisor.state.status is SupervisorStatus.DECIDING
+    assert supervisor.state.awaiting_approval is False
+    assert supervisor.state.active_recovery_decision_id is None
+    assert supervisor.state.pending_approval_decision_id is None
+    assert supervisor.state.recovery_budget_remaining == 1
+    assert supervisor.state.recovery_attempts == 0
+
+
+@pytest.mark.parametrize("approved", [0, 1, "true", None])
+def test_approval_choice_is_a_strict_bool(approved: object) -> None:
+    supervisor, *_ = _supervisor()
+    with pytest.raises(TypeError, match="approved"):
+        supervisor.resolve_recovery_approval(
+            decision_id="decision-pending",
+            approved=approved,  # type: ignore[arg-type]
+            reason="Invalid choice",
+        )
+
+
+def test_approval_rejects_missing_pending_wrong_identity_and_missing_gate() -> None:
+    supervisor, *_ = _supervisor()
+    with pytest.raises(ValueError, match="pending"):
+        supervisor.resolve_recovery_approval(
+            decision_id="decision-unknown",
+            approved=False,
+            reason="No pending decision",
+        )
+
+    anomaly = _anomaly()
+    decision = _pending_decision(anomaly)
+    supervisor, *_ = _supervisor(
+        validation=_validation(status=ValidationStatus.BLOCK),
+        anomalies=[anomaly],
+        decisions=[decision],
+    )
+    supervisor.on_process_exited(
+        run_context=_run_context(),
+        execution_handle=_handle(bound=True, alive=False),
+    )
+    with pytest.raises(ValueError, match="decision_id"):
+        supervisor.resolve_recovery_approval(
+            decision_id="decision-other",
+            approved=False,
+            reason="Wrong identity",
+        )
+    with pytest.raises(RuntimeError, match="approval gate"):
+        supervisor.resolve_recovery_approval(
+            decision_id=decision.decision_id,
+            approved=False,
+            reason="No gate",
+        )
+
+
+def test_gate_failure_is_wrapped_and_pending_state_is_preserved() -> None:
+    anomaly = _anomaly()
+    decision = _pending_decision(anomaly)
+    gate = RecordingApprovalGate(RuntimeError("private approval content"))
+    supervisor, *_ = _supervisor(
+        validation=_validation(status=ValidationStatus.BLOCK),
+        anomalies=[anomaly],
+        decisions=[decision],
+        approval_gate=gate,
+    )
+    supervisor.on_process_exited(
+        run_context=_run_context(),
+        execution_handle=_handle(bound=True, alive=False),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^Feedback Supervisor approval resolution failed$",
+    ) as caught:
+        supervisor.resolve_recovery_approval(
+            decision_id=decision.decision_id,
+            approved=False,
+            reason="Trigger the gate error",
+        )
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert supervisor.pending_decision == decision
+    assert supervisor.state.awaiting_approval is True
+
+
+def test_automatic_low_risk_decision_never_enters_the_approval_gate() -> None:
+    anomaly = _anomaly()
+    decision = _automatic_decision(anomaly)
+    gate = RecordingApprovalGate()
+    supervisor, *_ = _supervisor(
+        validation=_validation(status=ValidationStatus.BLOCK),
+        anomalies=[anomaly],
+        decisions=[decision],
+        approval_gate=gate,
+    )
+
+    result = supervisor.on_process_exited(
+        run_context=_run_context(),
+        execution_handle=_handle(bound=True, alive=False),
+    )
+
+    assert result == decision
+    assert supervisor.pending_decision is None
+    assert supervisor.state.awaiting_approval is False
+    assert gate.calls == []
 
 
 @pytest.mark.parametrize("snapshot_run_id", ["", "find-other-run"])
