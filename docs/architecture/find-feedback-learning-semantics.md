@@ -13,9 +13,10 @@
 
 This document records both the Stage 0 responsibility freeze and subsequent
 pre-implementation semantic decisions. The three foundational evidence contracts
-and the three v2 runtime carrier fields now exist. Observer, Validator, and
-AnomalyBuilder do not yet produce or propagate `EvidenceFact`, and recording is
-not connected to production.
+and the three v2 runtime carrier fields now exist. `FileProgressObserver` produces
+the first bounded `EvidenceFact` values, and `FindAnomalyBuilder` validates and
+propagates upstream Facts. Validator Fact production and recording remain
+unconnected to production.
 
 ## 2. Normative target data flow
 
@@ -86,8 +87,10 @@ that run.
 as foundational data contracts. `ProgressSnapshot`, `ValidationResult`, and
 `Anomaly` can carry `EvidenceFact`. `FileProgressObserver` produces the first
 bounded Facts for `find.seconds_without_progress`, `find.source_total`, and
-`find.source_limited`. Validator does not yet produce Facts, AnomalyBuilder does
-not yet propagate them, and Advisor does not yet produce definitions or rules.
+`find.source_limited`. `FindAnomalyBuilder` validates their upstream identity and
+propagates them without recomputation. Validator does not yet produce Facts, and
+Advisor does not yet produce definitions or rules. `EvidenceDefinition` and
+`EvidenceCollectionRule` are not connected to production components.
 
 ## 5. Source outcome classification
 
@@ -132,7 +135,8 @@ serialization behavior of unrelated contracts.
 
 The v2 carrier contracts and their local v1-to-v2 migrations are implemented.
 Observer production is connected only for the three bounded Facts listed above;
-Validator production and AnomalyBuilder propagation remain unimplemented.
+Validator production remains unimplemented, while AnomalyBuilder validation and
+propagation are implemented.
 
 ## 7. ExperienceCase v2 root-cause semantics
 
@@ -182,8 +186,9 @@ One `EvidenceMatchCondition` has exactly these semantic fields:
 
 The first operator set is closed to `eq`, `gte`, and `lte`. The first
 `baseline_source` set is closed to `literal`, `run_context`, and `fact`.
-Nullability and cross-field requirements among `baseline_ref` and
-`baseline_value` remain to be fixed before the contract implementation batch.
+The implemented contract enforces the source-specific nullability and shape of
+`baseline_ref` and `baseline_value`; execution support is separately bounded
+below.
 
 The contract describes an inert condition only. It does not execute matching,
 authorize recovery, or evaluate evidence. Controller remains the sole owner of
@@ -296,6 +301,101 @@ Controller may then call Advisor. This batch does not create a general root-caus
 catalog, a second matching contract, a `RootCauseMatcher`, or a Curator. There is
 no `RootCauseMatcher` and no Curator in this flow.
 
+### 9.4 First Controller condition-execution boundary
+
+This subsection freezes the behavior of the first future Controller evaluator.
+It does not claim that condition evaluation is currently implemented and does
+not add another matching component.
+
+#### Empty conditions and legacy notes
+
+Empty `applicability_conditions` fail closed. Such a case must not produce a
+`RecoveryDecision`, and `Anomaly.kind` alone cannot make the case match. The case
+may remain available as legacy history or Advisor context. Migrated v1 text stays
+in `applicability_notes`; Controller must not parse `applicability_notes` into
+machine conditions or use it as an automatic recovery basis.
+
+#### Unambiguous current-run Fact lookup
+
+For each condition, Controller searches the current `Anomaly.evidence_facts` by
+`EvidenceMatchCondition.evidence_code`. Matching may continue only when there is
+exactly one Fact with the requested `evidence_code`. A missing Fact makes the
+case a non-match. Multiple Facts with the same `evidence_code` are ambiguous,
+even when their values are equal, and also make the case a non-match. Controller
+must not choose the first, last, minimum, or maximum Fact.
+
+This automatic lookup rule does not restrict Anomaly's audit payload from
+carrying Facts from distinct real sources. Controller must not construct a Fact
+from `EvidenceRef`, `process_facts`, `artifact_facts`, `timing_facts`, or
+`missing_evidence`, and it must not substitute a guessed value.
+
+#### Executable baseline sources
+
+The first Controller evaluator executes only `literal` baselines. `run_context`
+and `fact` remain valid contract values, but they are not executable by the first
+evaluator. A case containing either deferred source is treated as lacking a
+currently executable deterministic condition and continues with the next
+candidate case. The evaluator must not interpret `baseline_ref`, dynamically
+resolve a path, or crash. Deferred support does not remove either value from the
+contract.
+
+#### Safe comparison types
+
+For `gte` and `lte`, both `Fact.value` and `baseline_value` must be finite,
+non-boolean JSON numbers. Bool is not a number. NaN and Infinity never
+participate in matching. Int and float may be compared numerically after bool is
+excluded. Incompatible values make the condition false; the evaluator does not
+convert strings to numbers or truth values.
+
+For `eq`, both operands must have the same JSON type, except that finite,
+non-boolean int and float values share numeric equality. Bool compares only with
+bool, strings only with strings, arrays compare only with arrays using JSON
+structural equality, and objects compare only with objects using JSON structural
+equality. No custom-object comparison or implicit conversion is allowed.
+
+#### Case conjunction and processing order
+
+All `applicability_conditions` in one case must match. One case represents one
+complete AND branch; it contains no OR expression, script, or dynamic execution.
+A missing or ambiguous Fact, unsupported baseline, incompatible type, or false
+comparison makes the whole case a non-match.
+
+The fixed processing order is:
+
+```text
+Store coarse candidate selection
+    -> Controller Evidence-condition matching
+    -> existing qualification, risk, budget, and action-safety checks
+    -> RecoveryDecision
+```
+
+An Evidence non-match continues to the next case. It does not enter the
+matched-but-unsafe-action STOP path and must not stop on the first non-matching
+candidate. Only a case whose Fact conditions already match may reach the
+existing action-safety STOP behavior.
+
+#### Advisor and approval boundaries
+
+Advisor is called at most once after every candidate case fails to form a
+reliable match, provided the existing blocking, recovery-eligibility, hard-stop,
+successful-Store-query, and injected-Advisor preconditions all hold. Store
+failure remains a fail-closed infrastructure error; it is not converted into an
+empty experience result and does not call Advisor.
+
+`root_cause_status == suspected` requires human approval, even when the recovery
+action is marked low risk. This includes the first `source_access_degraded`
+experience. Recovery PASS does not promote `suspected` to `confirmed`.
+
+#### Candidate completeness before limiting
+
+Because Controller owns Evidence-condition evaluation, it must be able to
+inspect the complete coarse candidate set or use stable pagination until a
+reliable match is found or candidates are exhausted. Any final display or
+selection limit is applied only after Evidence filtering. The implementation
+must not substitute an arbitrary fixed larger limit for complete traversal or
+stable pagination. This batch does not choose between those two compatible
+mechanisms.
+
 ## 10. Initial Anomaly immutability
 
 The initial `Anomaly` is a snapshot of Observer/Validator evidence available at
@@ -362,13 +462,17 @@ This section is normative target behavior. Stage 0 does not implement Writer,
   `RecoveryDecision`, `ExperienceCase`, and validation/process contracts.
 - Foundational `EvidenceFact`, `EvidenceDefinition`, and
   `EvidenceCollectionRule` contracts, including public exports and contract
-  serialization tests. They are not connected to production components.
+  serialization tests.
+- `EvidenceMatchCondition` and `ExperienceCase` v2 are implemented, including
+  public exports, validation, serialization, and v1 migration boundaries.
 - `ProgressSnapshot`, `ValidationResult`, and `Anomaly` v2 can carry validated,
   detached `EvidenceFact` values and locally migrate valid v1 payloads to empty
   Fact lists.
 - `FileProgressObserver` produces `find.seconds_without_progress` for a bound
   run, plus `find.source_total` and `find.source_limited` only when the current
   progress payload contains a valid source-status list.
+- `FindAnomalyBuilder` validates and propagates upstream Facts without changing
+  Fact identity, value, order, or existing `Anomaly.kind` classification.
 - Observer, Validator, AnomalyBuilder, Controller, Advisor, approval Gate, and
   Supervisor behavior for the currently supported fields and recovery flow.
 - Read-only `ExperienceStore` and `RecoveryExperienceStore` query interfaces.
@@ -389,11 +493,16 @@ This section is normative target behavior. Stage 0 does not implement Writer,
 
 ### Not implemented
 
-- Validator production of `EvidenceFact` and AnomalyBuilder propagation of
-  upstream Facts.
-- `EvidenceMatchCondition` and `ExperienceCase` v2.
-- Advisor extensions for new root-cause hypotheses, evidence definitions, or
-  evidence collection rules.
+- Validator does not yet produce `EvidenceFact`.
+- Controller does not yet execute `EvidenceMatchCondition`.
+- Store does not yet match cases against current-run Facts, and complete coarse
+  candidate traversal or stable pagination has not been selected.
+- `run_context` and `fact` baseline execution is not implemented; the first
+  future evaluator is limited to `literal`.
+- `find.source_failed` is not yet produced as an `EvidenceFact`, so the failed
+  source-access branch is not executable from current production Facts.
+- Advisor evidence-definition and collection-rule wiring is not implemented,
+  nor can the current proposal express the future root-cause/evidence model.
 - Temporary evidence-rule injection into a recovery run.
 - Concrete `FindExperienceRecorder`.
 - `ExperienceCaseWriter` and `JsonExperienceStore.append_case()`.

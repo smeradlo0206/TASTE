@@ -26,7 +26,7 @@ OBSERVED_AT = datetime(2026, 9, 12, 9, 0, tzinfo=timezone.utc)
 
 def _condition(**overrides: object) -> EvidenceMatchCondition:
     values: dict[str, object] = {
-        "evidence_code": "find.source_failed_count",
+        "evidence_code": "find.source_failed",
         "operator": "eq",
         "baseline_source": "literal",
         "baseline_ref": None,
@@ -38,7 +38,7 @@ def _condition(**overrides: object) -> EvidenceMatchCondition:
 
 def _fact(**overrides: object) -> EvidenceFact:
     values: dict[str, object] = {
-        "code": "find.source_failed_count",
+        "code": "find.source_failed",
         "value": 2,
         "source_contract_id": "snapshot-001",
         "source_field": "counts.source_failed",
@@ -304,7 +304,7 @@ def test_experience_case_v2_rejects_wrong_nested_types_and_string_conditions() -
             applicability_conditions=[
                 EvidenceCollectionRule(
                     rule_id="source-failure-count",
-                    evidence_code="find.source_failed_count",
+                    evidence_code="find.source_failed",
                     source_field="counts.source_failed",
                     collector="progress_snapshot_field",
                     collector_parameters={},
@@ -342,8 +342,8 @@ def test_experience_case_v2_copies_nested_inputs_and_serialized_output() -> None
         applicability_conditions=conditions,
         applicability_notes=notes,
     )
-    facts.append(_fact(code="find.source_limited_count"))
-    conditions.append(_condition(evidence_code="find.source_limited_count"))
+    facts.append(_fact(code="find.source_limited"))
+    conditions.append(_condition(evidence_code="find.source_limited"))
     notes.append("changed")
     fact.value["sources"].append("mutated-original-fact")
     condition.baseline_value["limit"].append(1)

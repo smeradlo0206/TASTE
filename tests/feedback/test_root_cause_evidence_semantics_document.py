@@ -93,3 +93,99 @@ def test_no_general_root_cause_catalog_is_created() -> None:
     assert "does not create a general root-cause catalog" in document
     assert "no rootcausematcher" in document
     assert "no curator" in document
+
+
+def test_empty_conditions_fail_closed_without_parsing_legacy_notes() -> None:
+    document = _document()
+
+    assert "empty applicability_conditions fail closed" in document
+    assert "must not produce a recoverydecision" in document
+    assert "anomaly.kind alone cannot make the case match" in document
+    assert "may remain available as legacy history or advisor context" in document
+    assert "must not parse applicability_notes into machine conditions" in document
+
+
+def test_fact_lookup_requires_one_unambiguous_current_anomaly_fact() -> None:
+    document = _document()
+
+    assert "exactly one fact with the requested evidence_code" in document
+    assert "multiple facts with the same evidence_code are ambiguous" in document
+    assert "even when their values are equal" in document
+    assert "must not choose the first, last, minimum, or maximum" in document
+    for legacy_source in (
+        "evidenceref",
+        "process_facts",
+        "artifact_facts",
+        "timing_facts",
+        "missing_evidence",
+    ):
+        assert legacy_source in document
+
+
+def test_first_condition_execution_supports_only_literal_baselines() -> None:
+    document = _document()
+
+    assert "the first controller evaluator executes only literal baselines" in document
+    assert "run_context and fact remain valid contract values" in document
+    assert "not executable by the first evaluator" in document
+    assert "must not interpret baseline_ref" in document
+    assert "continues with the next candidate case" in document
+
+
+def test_condition_comparisons_use_safe_json_type_rules() -> None:
+    document = _document()
+
+    assert "bool is not a number" in document
+    assert "nan and infinity never participate in matching" in document
+    assert "int and float may be compared numerically" in document
+    assert "does not convert strings to numbers or truth values" in document
+    assert "arrays compare only with arrays" in document
+    assert "objects compare only with objects" in document
+
+
+def test_case_conditions_are_and_and_nonmatches_do_not_enter_action_stop() -> None:
+    document = _document()
+
+    assert "all applicability_conditions in one case must match" in document
+    assert "one case represents one complete and branch" in document
+    assert "an evidence non-match continues to the next case" in document
+    assert "does not enter the matched-but-unsafe-action stop path" in document
+
+
+def test_advisor_and_suspected_approval_boundaries_are_explicit() -> None:
+    document = _document()
+
+    assert "advisor is called at most once after every candidate case fails" in document
+    assert "store failure remains a fail-closed infrastructure error" in document
+    assert "root_cause_status == suspected requires human approval" in document
+    assert "even when the recovery action is marked low risk" in document
+    assert "recovery pass does not promote suspected to confirmed" in document
+
+
+def test_store_does_not_truncate_candidates_before_evidence_filtering() -> None:
+    document = _document()
+
+    assert "complete coarse candidate set" in document
+    assert "stable pagination" in document
+    assert "only after evidence filtering" in document
+    assert "must not substitute an arbitrary fixed larger limit" in document
+
+
+def test_current_implementation_status_matches_the_evidence_pipeline() -> None:
+    document = _document()
+
+    assert "evidencematchcondition and experiencecase v2 are implemented" in document
+    assert "anomalybuilder validates and propagates upstream facts" in document
+    assert "validator does not yet produce evidencefact" in document
+    assert "controller does not yet execute evidencematchcondition" in document
+    assert "store does not yet match cases against current-run facts" in document
+    assert "run_context and fact baseline execution is not implemented" in document
+    assert "find.source_failed is not yet produced as an evidencefact" in document
+    assert "advisor evidence-definition and collection-rule wiring is not implemented" in document
+
+
+def test_source_failed_has_no_count_alias_in_the_authoritative_vocabulary() -> None:
+    document = _document()
+
+    assert "find.source_failed" in document
+    assert "find.source_failed_count" not in document
