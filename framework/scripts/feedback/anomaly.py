@@ -7,6 +7,7 @@ from uuid import uuid4
 from .contracts import (
     Anomaly,
     ArtifactRef,
+    EvidenceFact,
     EvidenceRef,
     ProgressSnapshot,
     ProgressStatus,
@@ -415,6 +416,57 @@ def _optional_anomaly_fields(
     return values
 
 
+def _validated_upstream_facts(
+    progress_snapshot: ProgressSnapshot | None,
+    validation_result: ValidationResult | None,
+) -> list[EvidenceFact]:
+    facts: list[EvidenceFact] = []
+    sources: list[
+        tuple[str, list[EvidenceFact], tuple[tuple[str, object], ...]]
+    ] = []
+    if progress_snapshot is not None:
+        sources.append(
+            (
+                "progress_snapshot",
+                progress_snapshot.evidence_facts,
+                (
+                    ("run_id", progress_snapshot.run_id),
+                    ("producer", progress_snapshot.producer),
+                    ("source_contract_id", progress_snapshot.snapshot_id),
+                    ("observed_at", progress_snapshot.observed_at),
+                ),
+            )
+        )
+    if validation_result is not None:
+        sources.append(
+            (
+                "validation_result",
+                validation_result.evidence_facts,
+                (
+                    ("run_id", validation_result.run_id),
+                    ("producer", validation_result.producer),
+                    ("source_contract_id", validation_result.validation_id),
+                    ("observed_at", validation_result.validated_at),
+                ),
+            )
+        )
+
+    for source_name, source_facts, expected_identity in sources:
+        for index, fact in enumerate(source_facts):
+            if not isinstance(fact, EvidenceFact):
+                raise ValueError(
+                    f"{source_name}.evidence_facts[{index}] must be an EvidenceFact"
+                )
+            for field_name, expected_value in expected_identity:
+                if getattr(fact, field_name) != expected_value:
+                    raise ValueError(
+                        f"{source_name}.evidence_facts[{index}].{field_name} "
+                        f"must match its source contract"
+                    )
+            facts.append(fact)
+    return facts
+
+
 class FindAnomalyBuilder:
     """Build one deterministic anomaly classification from structured evidence."""
 
@@ -441,6 +493,11 @@ class FindAnomalyBuilder:
                 or progress_snapshot.run_id != validation_result.run_id
             ):
                 raise ValueError("dual inputs must describe the same bound run")
+
+        evidence_facts = _validated_upstream_facts(
+            progress_snapshot,
+            validation_result,
+        )
 
         progress_kind = (
             _progress_kind(progress_snapshot)
@@ -527,6 +584,7 @@ class FindAnomalyBuilder:
                 validation_result,
             ),
             evidence_refs=_collect_evidence(progress_snapshot, validation_result),
+            evidence_facts=evidence_facts,
             root_cause_status="unknown",
             affected_phase=(
                 progress_snapshot.phase
