@@ -6,6 +6,9 @@ import pytest
 
 from feedback import (
     ArtifactRef,
+    EvidenceCollectionRule,
+    EvidenceDefinition,
+    EvidenceFact,
     EvidenceRef,
     ExperienceCase,
     ExperienceQuery,
@@ -22,6 +25,41 @@ from feedback import (
 
 
 OBSERVED_AT = datetime(2026, 8, 31, 13, 0, tzinfo=timezone.utc)
+
+
+def _evidence_fact() -> EvidenceFact:
+    return EvidenceFact(
+        code="find.candidate_count",
+        value={"counts": [1, 2], "details": {"phase": "scoring"}},
+        source_contract_id="snapshot-mapping",
+        source_field="counts.candidates",
+        producer="contract-mapping-observer",
+        run_id="find-mapping",
+        observed_at=OBSERVED_AT,
+    )
+
+
+def _evidence_definition() -> EvidenceDefinition:
+    return EvidenceDefinition(
+        code="find.candidate_count",
+        value_type="integer",
+        intended_producer="contract-mapping-observer",
+        description="Number of candidates actually observed by Find.",
+    )
+
+
+def _evidence_collection_rule() -> EvidenceCollectionRule:
+    return EvidenceCollectionRule(
+        rule_id="find-candidate-count-from-progress",
+        evidence_code="find.candidate_count",
+        source_field="counts.candidates",
+        collector="progress_snapshot_field",
+        collector_parameters={
+            "path": ["scoring", "queue_depth"],
+            "options": {"strict": True},
+        },
+        implementation_status="ready",
+    )
 
 
 def _case(*, case_id: str, project_id: str | None, context_tags: list[str]) -> ExperienceCase:
@@ -194,3 +232,123 @@ def test_find_before_stage_contract_chain_is_compatible(project_id: str | None) 
             "config_fingerprint",
             "selection_fingerprint",
         } & set(payload)
+
+
+@pytest.mark.parametrize(
+    "original",
+    [_evidence_fact(), _evidence_definition(), _evidence_collection_rule()],
+)
+def test_evidence_contracts_support_dict_and_json_round_trips(
+    original: EvidenceFact | EvidenceDefinition | EvidenceCollectionRule,
+) -> None:
+    restored_from_dict = type(original).from_dict(original.to_dict())
+    restored_from_json = type(original).from_json(original.to_json())
+
+    assert restored_from_dict == original
+    assert restored_from_dict is not original
+    assert restored_from_json == original
+    assert restored_from_json is not original
+
+
+def test_evidence_fact_copies_nested_value_input_and_serialized_output() -> None:
+    value = {
+        "counts": [1, 2],
+        "details": {"phase": "scoring"},
+    }
+    fact = EvidenceFact(
+        code="find.candidate_count",
+        value=value,
+        source_contract_id="snapshot-mapping",
+        source_field="counts.candidates",
+        producer="contract-mapping-observer",
+        run_id="find-mapping",
+        observed_at=OBSERVED_AT,
+    )
+
+    value["counts"].append(3)
+    value["details"]["phase"] = "changed"
+    serialized = fact.to_dict()
+    serialized_value = serialized["value"]
+    assert isinstance(serialized_value, dict)
+    serialized_value["counts"].append(4)
+    serialized_value["details"]["phase"] = "serialized-change"
+
+    assert fact.value == {
+        "counts": [1, 2],
+        "details": {"phase": "scoring"},
+    }
+
+
+def test_collection_rule_copies_nested_parameter_input_and_serialized_output() -> None:
+    parameters = {
+        "path": ["scoring", "queue_depth"],
+        "options": {"strict": True},
+    }
+    rule = EvidenceCollectionRule(
+        rule_id="find-queue-depth",
+        evidence_code="find.queue_depth",
+        source_field="queue.depth",
+        collector="progress_snapshot_field",
+        collector_parameters=parameters,
+        implementation_status="needs_instrumentation",
+    )
+
+    parameters["path"].append("changed")
+    parameters["options"]["strict"] = False
+    serialized = rule.to_dict()
+    serialized_parameters = serialized["collector_parameters"]
+    assert isinstance(serialized_parameters, dict)
+    serialized_parameters["path"].append("serialized-change")
+    serialized_parameters["options"]["strict"] = False
+
+    assert rule.collector_parameters == {
+        "path": ["scoring", "queue_depth"],
+        "options": {"strict": True},
+    }
+
+
+@pytest.mark.parametrize(
+    "original",
+    [_evidence_fact(), _evidence_definition(), _evidence_collection_rule()],
+)
+def test_evidence_contracts_reject_unknown_fields(
+    original: EvidenceFact | EvidenceDefinition | EvidenceCollectionRule,
+) -> None:
+    payload = original.to_dict()
+    payload["unexpected_field"] = "value"
+
+    with pytest.raises(ValueError, match=r"unexpected_field.*unknown"):
+        type(original).from_dict(payload)
+
+
+def test_evidence_contract_mapping_restores_types_and_schema_versions() -> None:
+    fact = EvidenceFact.from_json(_evidence_fact().to_json())
+    rule = EvidenceCollectionRule.from_json(_evidence_collection_rule().to_json())
+
+    assert isinstance(fact.observed_at, datetime)
+    assert fact.observed_at.tzinfo is not None
+    assert isinstance(rule.collector_parameters, dict)
+    assert fact.schema_version == "feedback.evidence_fact.v1"
+    assert rule.schema_version == "feedback.evidence_collection_rule.v1"
+
+
+def test_evidence_contracts_have_one_public_definition_each() -> None:
+    import feedback
+    from feedback.contracts import (
+        EvidenceCollectionRule as ContractEvidenceCollectionRule,
+        EvidenceDefinition as ContractEvidenceDefinition,
+        EvidenceFact as ContractEvidenceFact,
+    )
+
+    assert feedback.EvidenceFact is ContractEvidenceFact
+    assert feedback.EvidenceDefinition is ContractEvidenceDefinition
+    assert feedback.EvidenceCollectionRule is ContractEvidenceCollectionRule
+    assert EvidenceFact is ContractEvidenceFact
+    assert EvidenceDefinition is ContractEvidenceDefinition
+    assert EvidenceCollectionRule is ContractEvidenceCollectionRule
+    for name in (
+        "EvidenceFact",
+        "EvidenceDefinition",
+        "EvidenceCollectionRule",
+    ):
+        assert name in feedback.__all__

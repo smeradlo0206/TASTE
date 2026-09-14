@@ -384,7 +384,11 @@ class ArtifactRef(JsonContract):
 
 @dataclass
 class EvidenceRef(JsonContract):
-    """A compact reference to evidence associated with a contract outcome."""
+    """A compact reference to evidence associated with a contract outcome.
+
+    ``kind`` classifies the reference itself, such as log, artifact, or
+    validation evidence. It is not a machine-readable observed fact code.
+    """
 
     kind: str
     summary: str
@@ -469,7 +473,11 @@ class ParameterChange(JsonContract):
 
 @dataclass
 class ValidationCheck(JsonContract):
-    """One deterministic validation result and its supporting evidence."""
+    """One deterministic validation result and its supporting evidence.
+
+    ``code`` identifies one validation check. It is distinct from the code of
+    a reusable observed fact.
+    """
 
     code: str
     status: ValidationStatus
@@ -601,6 +609,341 @@ def _reject_secret_in_value(
                 contract_name=contract_name,
                 field_path=f"{field_path}[{index}]",
             )
+
+
+@dataclass(kw_only=True)
+class EvidenceFact(JsonContract):
+    """One machine-readable fact actually observed by a feedback producer.
+
+    ``code`` identifies one reusable observed fact: what was observed, not why
+    the anomaly occurred. It is not an Anomaly kind, EvidenceRef kind,
+    ValidationCheck code, or root-cause code.
+    """
+
+    code: str
+    value: object
+    source_contract_id: str
+    source_field: str
+    producer: str
+    run_id: str
+    observed_at: datetime
+    schema_version: str = "feedback.evidence_fact.v1"
+
+    def __post_init__(self) -> None:
+        contract_name = type(self).__name__
+        for field_name in (
+            "code",
+            "source_contract_id",
+            "source_field",
+            "producer",
+            "run_id",
+        ):
+            _require_non_empty_string(
+                getattr(self, field_name),
+                contract_name=contract_name,
+                field_path=field_name,
+            )
+        if self.value is None:
+            raise _error(contract_name, "value", "must not be null")
+        self.value = _to_json_value(
+            self.value,
+            contract_name=contract_name,
+            field_path="value",
+        )
+        _reject_secret_in_value(
+            self.value,
+            contract_name=contract_name,
+            field_path="value",
+        )
+        if not isinstance(self.observed_at, datetime):
+            raise _error(
+                contract_name,
+                "observed_at",
+                "must be a timezone-aware datetime",
+            )
+        _require_aware_datetime(
+            self.observed_at,
+            contract_name=contract_name,
+            field_path="observed_at",
+        )
+        if self.schema_version != "feedback.evidence_fact.v1":
+            raise _error(
+                contract_name,
+                "schema_version",
+                "must equal feedback.evidence_fact.v1",
+            )
+
+
+def _normalize_evidence_facts(
+    value: object,
+    *,
+    contract_name: str,
+    field_path: str = "evidence_facts",
+) -> list[EvidenceFact]:
+    items = _require_list(
+        value,
+        contract_name=contract_name,
+        field_path=field_path,
+    )
+    normalized: list[EvidenceFact] = []
+    first_by_identity: dict[tuple[str, str, str], EvidenceFact] = {}
+    for index, item in enumerate(items):
+        item_path = f"{field_path}[{index}]"
+        if not isinstance(item, EvidenceFact):
+            raise _error(contract_name, item_path, "must be an EvidenceFact")
+        copied = deepcopy(item)
+        identity = (
+            copied.code,
+            copied.source_contract_id,
+            copied.source_field,
+        )
+        first = first_by_identity.get(identity)
+        if first is not None:
+            if copied != first:
+                raise _error(
+                    contract_name,
+                    item_path,
+                    "conflicts with an earlier EvidenceFact of the same identity",
+                )
+            continue
+        first_by_identity[identity] = copied
+        normalized.append(copied)
+    return normalized
+
+
+def _migrate_runtime_evidence_carrier_payload(
+    data: Mapping[str, object],
+    *,
+    contract_name: str,
+    v1_schema: str,
+    v2_schema: str,
+) -> Mapping[str, object]:
+    if not isinstance(data, MappingABC):
+        raise _error(contract_name, "", "must be an object")
+    schema_version = data.get("schema_version")
+    if schema_version == v1_schema:
+        if "evidence_facts" in data:
+            raise _error(contract_name, "evidence_facts", "is unknown")
+        migrated = dict(data)
+        migrated["schema_version"] = v2_schema
+        migrated["evidence_facts"] = []
+        return migrated
+    if schema_version not in {None, v2_schema}:
+        raise _error(
+            contract_name,
+            "schema_version",
+            f"must equal {v1_schema} or {v2_schema}",
+        )
+    return data
+
+
+@dataclass(kw_only=True)
+class EvidenceDefinition(JsonContract):
+    """Define one evidence value that a producer may observe in a future run.
+
+    A definition describes what should be observed. It never contains an
+    observed value and is not itself evidence.
+    """
+
+    code: str
+    value_type: str
+    intended_producer: str
+    description: str
+    schema_version: str = "feedback.evidence_definition.v1"
+
+    def __post_init__(self) -> None:
+        contract_name = type(self).__name__
+        for field_name in (
+            "code",
+            "value_type",
+            "intended_producer",
+            "description",
+        ):
+            _require_non_empty_string(
+                getattr(self, field_name),
+                contract_name=contract_name,
+                field_path=field_name,
+            )
+        if self.value_type not in {
+            "boolean",
+            "integer",
+            "number",
+            "string",
+            "array",
+            "object",
+        }:
+            raise _error(
+                contract_name,
+                "value_type",
+                "must be one of boolean, integer, number, string, array, object",
+            )
+        _reject_secret_in_value(
+            self.description,
+            contract_name=contract_name,
+            field_path="description",
+        )
+        if self.schema_version != "feedback.evidence_definition.v1":
+            raise _error(
+                contract_name,
+                "schema_version",
+                "must equal feedback.evidence_definition.v1",
+            )
+
+
+@dataclass(kw_only=True)
+class EvidenceCollectionRule(JsonContract):
+    """Describe an inert proposal for collecting one defined evidence value.
+
+    The contract validates data shape only. It does not authorize or execute
+    the collector.
+    """
+
+    rule_id: str
+    evidence_code: str
+    source_field: str
+    collector: str
+    collector_parameters: Mapping[str, object]
+    implementation_status: str
+    schema_version: str = "feedback.evidence_collection_rule.v1"
+
+    def __post_init__(self) -> None:
+        contract_name = type(self).__name__
+        for field_name in (
+            "rule_id",
+            "evidence_code",
+            "source_field",
+            "collector",
+            "implementation_status",
+        ):
+            _require_non_empty_string(
+                getattr(self, field_name),
+                contract_name=contract_name,
+                field_path=field_name,
+            )
+        if self.implementation_status not in {
+            "ready",
+            "needs_instrumentation",
+            "unsupported",
+        }:
+            raise _error(
+                contract_name,
+                "implementation_status",
+                "must be one of ready, needs_instrumentation, unsupported",
+            )
+        copied_parameters = _require_mapping(
+            self.collector_parameters,
+            contract_name=contract_name,
+            field_path="collector_parameters",
+        )
+        self.collector_parameters = _to_json_value(
+            copied_parameters,
+            contract_name=contract_name,
+            field_path="collector_parameters",
+        )  # type: ignore[assignment]
+        _reject_secret_in_value(
+            self.collector_parameters,
+            contract_name=contract_name,
+            field_path="collector_parameters",
+        )
+        if self.schema_version != "feedback.evidence_collection_rule.v1":
+            raise _error(
+                contract_name,
+                "schema_version",
+                "must equal feedback.evidence_collection_rule.v1",
+            )
+
+
+@dataclass(kw_only=True)
+class EvidenceMatchCondition(JsonContract):
+    """Describe one inert comparison used by future experience matching.
+
+    The contract validates condition data only. It does not evaluate evidence,
+    authorize recovery, or execute a matcher.
+    """
+
+    evidence_code: str
+    operator: str
+    baseline_source: str
+    baseline_ref: str | None
+    baseline_value: object | None
+    schema_version: str = "feedback.evidence_match_condition.v1"
+
+    def __post_init__(self) -> None:
+        contract_name = type(self).__name__
+        for field_name in ("evidence_code", "operator", "baseline_source"):
+            _require_non_empty_string(
+                getattr(self, field_name),
+                contract_name=contract_name,
+                field_path=field_name,
+            )
+        if self.operator not in {"eq", "gte", "lte"}:
+            raise _error(
+                contract_name,
+                "operator",
+                "must be one of eq, gte, lte",
+            )
+        if self.baseline_source not in {"literal", "run_context", "fact"}:
+            raise _error(
+                contract_name,
+                "baseline_source",
+                "must be one of literal, run_context, fact",
+            )
+        if self.schema_version != "feedback.evidence_match_condition.v1":
+            raise _error(
+                contract_name,
+                "schema_version",
+                "must equal feedback.evidence_match_condition.v1",
+            )
+
+        self.baseline_ref = _optional_string(
+            self.baseline_ref,
+            contract_name=contract_name,
+            field_path="baseline_ref",
+        )
+        if self.baseline_source == "literal":
+            if self.baseline_ref is not None:
+                raise _error(
+                    contract_name,
+                    "baseline_ref",
+                    "must be null when baseline_source is literal",
+                )
+            if self.baseline_value is None:
+                raise _error(
+                    contract_name,
+                    "baseline_value",
+                    "must not be null when baseline_source is literal",
+                )
+            self.baseline_value = _to_json_value(
+                self.baseline_value,
+                contract_name=contract_name,
+                field_path="baseline_value",
+            )
+            _reject_secret_in_value(
+                self.baseline_value,
+                contract_name=contract_name,
+                field_path="baseline_value",
+            )
+            if self.operator in {"gte", "lte"} and (
+                isinstance(self.baseline_value, bool)
+                or not isinstance(self.baseline_value, (int, float))
+            ):
+                raise _error(
+                    contract_name,
+                    "baseline_value",
+                    "must be a finite non-boolean number for gte or lte",
+                )
+        else:
+            _require_non_empty_string(
+                self.baseline_ref,
+                contract_name=contract_name,
+                field_path="baseline_ref",
+            )
+            if self.baseline_value is not None:
+                raise _error(
+                    contract_name,
+                    "baseline_value",
+                    "must be null when baseline_source is run_context or fact",
+                )
 
 
 @dataclass(kw_only=True)
@@ -1257,7 +1600,7 @@ class ProgressSnapshot(JsonContract):
     source_limited: int
     source_failed: int
     status_reason: str
-    schema_version: str = "find.progress_snapshot.v1"
+    schema_version: str = "find.progress_snapshot.v2"
     raw_phase: str | None = None
     current: int | None = None
     total: int | None = None
@@ -1276,6 +1619,7 @@ class ProgressSnapshot(JsonContract):
     signals: list[str] = field(default_factory=list)
     observation_errors: list[str] = field(default_factory=list)
     evidence_refs: list[EvidenceRef] = field(default_factory=list)
+    evidence_facts: list[EvidenceFact] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         contract_name = type(self).__name__
@@ -1291,8 +1635,8 @@ class ProgressSnapshot(JsonContract):
         for field_name in ("raw_phase", "message", "termination_signal"):
             _optional_string(getattr(self, field_name), contract_name=contract_name, field_path=field_name)
 
-        if self.schema_version != "find.progress_snapshot.v1":
-            raise _error(contract_name, "schema_version", "must equal find.progress_snapshot.v1")
+        if self.schema_version != "find.progress_snapshot.v2":
+            raise _error(contract_name, "schema_version", "must equal find.progress_snapshot.v2")
         if not isinstance(self.status, ProgressStatus):
             raise _error(contract_name, "status", "must be a ProgressStatus")
         for field_name in ("created_at", "observed_at"):
@@ -1403,6 +1747,23 @@ class ProgressSnapshot(JsonContract):
             EvidenceRef,
             "evidence_refs",
         )
+        self.evidence_facts = _normalize_evidence_facts(
+            self.evidence_facts,
+            contract_name=contract_name,
+        )
+        for index, fact in enumerate(self.evidence_facts):
+            for field_name, expected in (
+                ("run_id", self.run_id),
+                ("producer", self.producer),
+                ("source_contract_id", self.snapshot_id),
+                ("observed_at", self.observed_at),
+            ):
+                if getattr(fact, field_name) != expected:
+                    raise _error(
+                        contract_name,
+                        f"evidence_facts[{index}].{field_name}",
+                        f"must match {field_name if field_name != 'source_contract_id' else 'snapshot_id'}",
+                    )
         self.source_signals = _copy_string_list(
             self.source_signals,
             contract_name=contract_name,
@@ -1418,6 +1779,16 @@ class ProgressSnapshot(JsonContract):
             contract_name=contract_name,
             field_path="observation_errors",
         )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> ProgressSnapshot:
+        migrated = _migrate_runtime_evidence_carrier_payload(
+            data,
+            contract_name=cls.__name__,
+            v1_schema="find.progress_snapshot.v1",
+            v2_schema="find.progress_snapshot.v2",
+        )
+        return super().from_dict(migrated)
 
     def _copy_typed_list(
         self,
@@ -1495,7 +1866,7 @@ class ValidationResult(JsonContract):
     candidate_digest: str
     bridge_probe_status: ValidationStatus
     input_artifact_refs: list[ArtifactRef]
-    schema_version: str = "find.validation_result.v1"
+    schema_version: str = "find.validation_result.v2"
     downstream_stage: str = "read"
     bridge_probe_errors: list[str] = field(default_factory=list)
     downstream_input_preview: Mapping[str, object] | None = None
@@ -1503,6 +1874,7 @@ class ValidationResult(JsonContract):
     blockers: list[str] = field(default_factory=list)
     failure_codes: list[str] = field(default_factory=list)
     evidence_refs: list[EvidenceRef] = field(default_factory=list)
+    evidence_facts: list[EvidenceFact] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         contract_name = type(self).__name__
@@ -1518,8 +1890,8 @@ class ValidationResult(JsonContract):
             "candidate_digest",
         ):
             _require_string(getattr(self, field_name), contract_name=contract_name, field_path=field_name)
-        if self.schema_version != "find.validation_result.v1":
-            raise _error(contract_name, "schema_version", "must equal find.validation_result.v1")
+        if self.schema_version != "find.validation_result.v2":
+            raise _error(contract_name, "schema_version", "must equal find.validation_result.v2")
         if self.downstream_stage != "read":
             raise _error(contract_name, "downstream_stage", "must equal read")
         _require_aware_datetime(self.created_at, contract_name=contract_name, field_path="created_at")
@@ -1601,6 +1973,23 @@ class ValidationResult(JsonContract):
             EvidenceRef,
             "evidence_refs",
         )
+        self.evidence_facts = _normalize_evidence_facts(
+            self.evidence_facts,
+            contract_name=contract_name,
+        )
+        for index, fact in enumerate(self.evidence_facts):
+            for field_name, expected in (
+                ("run_id", self.run_id),
+                ("producer", self.producer),
+                ("source_contract_id", self.validation_id),
+                ("observed_at", self.validated_at),
+            ):
+                if getattr(fact, field_name) != expected:
+                    raise _error(
+                        contract_name,
+                        f"evidence_facts[{index}].{field_name}",
+                        f"must match {field_name if field_name != 'source_contract_id' else 'validation_id'}",
+                    )
         for field_name in ("bridge_probe_errors", "warnings", "blockers", "failure_codes"):
             setattr(
                 self,
@@ -1619,6 +2008,16 @@ class ValidationResult(JsonContract):
                 contract_name=contract_name,
                 field_path="downstream_input_preview",
             )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> ValidationResult:
+        migrated = _migrate_runtime_evidence_carrier_payload(
+            data,
+            contract_name=cls.__name__,
+            v1_schema="find.validation_result.v1",
+            v2_schema="find.validation_result.v2",
+        )
+        return super().from_dict(migrated)
 
     def _copy_typed_list(
         self,
@@ -1688,7 +2087,10 @@ def _copy_mapping_list(
 
 @dataclass(kw_only=True)
 class Anomaly(JsonContract):
-    """Evidence-backed description of one observed Find anomaly."""
+    """Evidence-backed description of one observed Find anomaly.
+
+    ``kind`` is an observed anomaly classification, not a root-cause code.
+    """
 
     anomaly_id: str
     run_id: str
@@ -1713,7 +2115,7 @@ class Anomaly(JsonContract):
     retryable_signal: bool
     fingerprint: str
     occurrence_count: int
-    schema_version: str = "find.anomaly.v1"
+    schema_version: str = "find.anomaly.v2"
     progress_snapshot_id: str | None = None
     validation_id: str | None = None
     process_facts: Mapping[str, object] = field(default_factory=dict)
@@ -1725,6 +2127,7 @@ class Anomaly(JsonContract):
     affected_sources: list[str] = field(default_factory=list)
     affected_artifacts: list[str] = field(default_factory=list)
     duplicate_of: str | None = None
+    evidence_facts: list[EvidenceFact] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         contract_name = type(self).__name__
@@ -1743,8 +2146,8 @@ class Anomaly(JsonContract):
             _require_string(getattr(self, field_name), contract_name=contract_name, field_path=field_name)
         for field_name in ("progress_snapshot_id", "validation_id", "root_cause", "duplicate_of"):
             _optional_string(getattr(self, field_name), contract_name=contract_name, field_path=field_name)
-        if self.schema_version != "find.anomaly.v1":
-            raise _error(contract_name, "schema_version", "must equal find.anomaly.v1")
+        if self.schema_version != "find.anomaly.v2":
+            raise _error(contract_name, "schema_version", "must equal find.anomaly.v2")
         if self.kind not in SUPPORTED_FIND_ANOMALY_KINDS:
             raise _error(contract_name, "kind", "is not a supported Find anomaly kind")
         if self.root_cause_status not in {"unknown", "suspected", "confirmed"}:
@@ -1793,6 +2196,31 @@ class Anomaly(JsonContract):
         self.evidence_refs = self._copy_evidence_refs(self.evidence_refs)
         if not self.evidence_refs:
             raise _error(contract_name, "evidence_refs", "must contain at least one evidence reference")
+        self.evidence_facts = _normalize_evidence_facts(
+            self.evidence_facts,
+            contract_name=contract_name,
+        )
+        allowed_source_contract_ids = {
+            source_contract_id
+            for source_contract_id in (
+                self.progress_snapshot_id,
+                self.validation_id,
+            )
+            if source_contract_id is not None
+        }
+        for index, fact in enumerate(self.evidence_facts):
+            if fact.run_id != self.run_id:
+                raise _error(
+                    contract_name,
+                    f"evidence_facts[{index}].run_id",
+                    "must match run_id",
+                )
+            if fact.source_contract_id not in allowed_source_contract_ids:
+                raise _error(
+                    contract_name,
+                    f"evidence_facts[{index}].source_contract_id",
+                    "must match progress_snapshot_id or validation_id",
+                )
 
         self.process_facts = _require_mapping(
             self.process_facts,
@@ -1836,6 +2264,16 @@ class Anomaly(JsonContract):
                     "evidence_refs",
                     "must include direct evidence when root_cause_status is confirmed",
                 )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> Anomaly:
+        migrated = _migrate_runtime_evidence_carrier_payload(
+            data,
+            contract_name=cls.__name__,
+            v1_schema="find.anomaly.v1",
+            v2_schema="find.anomaly.v2",
+        )
+        return super().from_dict(migrated)
 
     def _copy_evidence_refs(self, value: object) -> list[EvidenceRef]:
         contract_name = type(self).__name__
@@ -2286,7 +2724,7 @@ class ExperienceCase(JsonContract):
     matched_count: int
     applied_count: int
     successful_application_count: int
-    schema_version: str = "find.experience_case.v1"
+    schema_version: str = "find.experience_case.v2"
     stage: str = "find"
     project_id: str | None = None
     environment_fingerprint: str | None = None
@@ -2294,7 +2732,7 @@ class ExperienceCase(JsonContract):
     anomaly_id: str | None = None
     anomaly_kind: str | None = None
     anomaly_fingerprint: str | None = None
-    confirmed_root_cause: str | None = None
+    root_cause: str | None = None
     decision_id: str | None = None
     recovery_action: RecoveryAction | None = None
     parameter_changes: list[ParameterChange] = field(default_factory=list)
@@ -2311,8 +2749,9 @@ class ExperienceCase(JsonContract):
     validation_before_status: ValidationStatus | None = None
     resolved_failure_codes: list[str] = field(default_factory=list)
     remaining_failure_codes: list[str] = field(default_factory=list)
-    applicability_conditions: list[str] = field(default_factory=list)
-    non_applicable_conditions: list[str] = field(default_factory=list)
+    evidence_facts: list[EvidenceFact] = field(default_factory=list)
+    applicability_notes: list[str] = field(default_factory=list)
+    applicability_conditions: list[EvidenceMatchCondition] = field(default_factory=list)
     recommended_action: RecoveryAction | None = None
     user_feedback: str | None = None
     user_labels: list[str] = field(default_factory=list)
@@ -2342,7 +2781,7 @@ class ExperienceCase(JsonContract):
             "anomaly_id",
             "anomaly_kind",
             "anomaly_fingerprint",
-            "confirmed_root_cause",
+            "root_cause",
             "decision_id",
             "playbook_id",
             "failure_reason",
@@ -2350,8 +2789,8 @@ class ExperienceCase(JsonContract):
             "user_feedback",
         ):
             _optional_string(getattr(self, field_name), contract_name=contract_name, field_path=field_name)
-        if self.schema_version != "find.experience_case.v1":
-            raise _error(contract_name, "schema_version", "must equal find.experience_case.v1")
+        if self.schema_version != "find.experience_case.v2":
+            raise _error(contract_name, "schema_version", "must equal find.experience_case.v2")
         if self.stage != "find":
             raise _error(contract_name, "stage", "must equal find")
         if self.case_type not in {"normal", "technical", "preference"}:
@@ -2360,8 +2799,18 @@ class ExperienceCase(JsonContract):
             raise _error(contract_name, "outcome", "must be one of success, recovered, failed, partial, cancelled")
         if self.root_cause_status not in {"unknown", "suspected", "confirmed"}:
             raise _error(contract_name, "root_cause_status", "must be one of unknown, suspected, confirmed")
-        if self.root_cause_status == "confirmed" and not self.confirmed_root_cause:
-            raise _error(contract_name, "confirmed_root_cause", "is required when root_cause_status is confirmed")
+        if self.root_cause is not None:
+            _require_non_empty_string(
+                self.root_cause,
+                contract_name=contract_name,
+                field_path="root_cause",
+            )
+        if self.root_cause_status == "confirmed" and self.root_cause is None:
+            raise _error(
+                contract_name,
+                "root_cause",
+                "is required when root_cause_status is confirmed",
+            )
         if self.anomaly_kind is not None and self.anomaly_kind not in SUPPORTED_FIND_ANOMALY_KINDS:
             raise _error(contract_name, "anomaly_kind", "is not a supported Find anomaly kind")
 
@@ -2458,15 +2907,10 @@ class ExperienceCase(JsonContract):
             contract_name=contract_name,
             field_path="remaining_failure_codes",
         )
-        self.applicability_conditions = _copy_string_list(
-            self.applicability_conditions,
+        self.applicability_notes = _copy_string_list(
+            self.applicability_notes,
             contract_name=contract_name,
-            field_path="applicability_conditions",
-        )
-        self.non_applicable_conditions = _copy_string_list(
-            self.non_applicable_conditions,
-            contract_name=contract_name,
-            field_path="non_applicable_conditions",
+            field_path="applicability_notes",
         )
         self.user_labels = _copy_string_list(
             self.user_labels,
@@ -2479,6 +2923,20 @@ class ExperienceCase(JsonContract):
             field_path="preference_scope",
         )
         self.evidence_refs = self._copy_typed_list(self.evidence_refs, EvidenceRef, "evidence_refs")
+        self.evidence_facts = deepcopy(
+            self._copy_typed_list(
+                self.evidence_facts,
+                EvidenceFact,
+                "evidence_facts",
+            )
+        )
+        self.applicability_conditions = deepcopy(
+            self._copy_typed_list(
+                self.applicability_conditions,
+                EvidenceMatchCondition,
+                "applicability_conditions",
+            )
+        )
         self.parameter_changes = self._copy_typed_list(
             self.parameter_changes,
             ParameterChange,
@@ -2547,6 +3005,62 @@ class ExperienceCase(JsonContract):
                     "ready_for_read_after",
                     "must be true when outcome is recovered",
                 )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> ExperienceCase:
+        if not isinstance(data, MappingABC):
+            raise _error(cls.__name__, "", "must be an object")
+
+        schema_version = data.get("schema_version")
+        if schema_version == "find.experience_case.v1":
+            for field_name in (
+                "root_cause",
+                "evidence_facts",
+                "applicability_notes",
+                "candidate_root_cause",
+                "root_cause_code",
+                "evidence_match_conditions",
+                "match_conditions",
+            ):
+                if field_name in data:
+                    raise _error(cls.__name__, field_name, "is unknown")
+
+            migrated = dict(data)
+            confirmed_root_cause = migrated.pop("confirmed_root_cause", None)
+            legacy_applicable = _copy_string_list(
+                migrated.pop("applicability_conditions", []),
+                contract_name=cls.__name__,
+                field_path="applicability_conditions",
+            )
+            legacy_non_applicable = _copy_string_list(
+                migrated.pop("non_applicable_conditions", []),
+                contract_name=cls.__name__,
+                field_path="non_applicable_conditions",
+            )
+            migrated.update(
+                {
+                    "schema_version": "find.experience_case.v2",
+                    "root_cause": confirmed_root_cause,
+                    "evidence_facts": [],
+                    "applicability_notes": [
+                        *legacy_applicable,
+                        *(
+                            f"non_applicable: {note}"
+                            for note in legacy_non_applicable
+                        ),
+                    ],
+                    "applicability_conditions": [],
+                }
+            )
+            return super().from_dict(migrated)
+
+        if schema_version not in {None, "find.experience_case.v2"}:
+            raise _error(
+                cls.__name__,
+                "schema_version",
+                "must equal find.experience_case.v1 or find.experience_case.v2",
+            )
+        return super().from_dict(data)
 
     def _copy_typed_list(
         self,

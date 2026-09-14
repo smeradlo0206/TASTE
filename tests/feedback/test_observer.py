@@ -199,19 +199,31 @@ def test_valid_progress_uses_preferred_paths_and_maps_fields(
     assert _artifact(snapshot, "progress").parse_status == "valid"
 
 
-def test_source_status_counts_use_failure_limited_ready_priority(
+@pytest.mark.parametrize(
+    ("row", "expected_ready", "expected_limited", "expected_failed"),
+    [
+        ({"ok": False, "limited": True}, 0, 1, 0),
+        ({"ok": True, "limited": True}, 0, 1, 0),
+        ({"ok": False, "limited": False}, 0, 0, 1),
+        ({"ok": True, "limited": False}, 1, 0, 0),
+        ({"ok": False, "limited": False, "rate_limited": True}, 0, 1, 0),
+        ({"ok": False, "limited": False, "error": "http_429"}, 0, 1, 0),
+        ({}, 0, 0, 0),
+    ],
+)
+def test_source_status_counts_use_limited_failed_ready_priority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    row: dict[str, object],
+    expected_ready: int,
+    expected_limited: int,
+    expected_failed: int,
 ) -> None:
     run_dir = tmp_path / "runs" / RUN_ID
-    rows = [
-        {"source": "ready", "ok": True},
-        {"source": "limited", "ok": True, "limited": True},
-        {"source": "failed", "ok": True, "limited": True, "error": "rate limited"},
-        {"source": "unknown"},
-        "invalid-row",
-    ]
-    _write_progress(run_dir, _progress_payload(source_status=rows))
+    _write_progress(
+        run_dir,
+        _progress_payload(source_status=[{"source": "tested", **row}]),
+    )
     _set_now(monkeypatch, NOW)
 
     snapshot = FileProgressObserver().observe(
@@ -219,12 +231,11 @@ def test_source_status_counts_use_failure_limited_ready_priority(
         _make_execution_handle(tmp_path, run_dir=run_dir),
     )
 
-    assert snapshot.source_total == 4
-    assert snapshot.source_ready == 1
-    assert snapshot.source_limited == 1
-    assert snapshot.source_failed == 1
-    assert snapshot.source_ready + snapshot.source_limited + snapshot.source_failed <= snapshot.source_total
-    assert any("source_status[4]" in item for item in snapshot.observation_errors)
+    assert snapshot.source_total == 1
+    assert snapshot.source_ready == expected_ready
+    assert snapshot.source_limited == expected_limited
+    assert snapshot.source_failed == expected_failed
+    assert snapshot.status is ProgressStatus.RUNNING
 
 
 def test_meaningful_progress_increments_sequence_and_resets_stall_time(

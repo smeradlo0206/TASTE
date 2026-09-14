@@ -987,6 +987,43 @@ def test_supervisor_does_not_mutate_inputs_or_expose_mutable_internal_state() ->
     assert supervisor.state.gate_reason == "Preparing Find supervision"
 
 
+def test_supervisor_evidence_accessors_start_empty_and_are_read_only() -> None:
+    supervisor, *_ = _supervisor()
+
+    assert supervisor.last_validation_result is None
+    assert supervisor.last_anomaly is None
+    assert FeedbackSupervisor.last_validation_result.fset is None
+    assert FeedbackSupervisor.last_anomaly.fset is None
+
+
+def test_supervisor_evidence_accessors_return_detached_terminal_evidence() -> None:
+    validation = _validation(status=ValidationStatus.BLOCK)
+    anomaly = _anomaly()
+    supervisor, *_ = _supervisor(
+        validation=validation,
+        anomalies=[anomaly],
+        decisions=[_decision(anomaly)],
+    )
+
+    supervisor.on_process_exited(
+        run_context=_run_context(),
+        execution_handle=_handle(bound=True, alive=False),
+    )
+    exposed_validation = supervisor.last_validation_result
+    exposed_anomaly = supervisor.last_anomaly
+
+    assert exposed_validation == validation
+    assert exposed_validation is not validation
+    assert exposed_anomaly == anomaly
+    assert exposed_anomaly is not anomaly
+    assert exposed_validation is not None
+    assert exposed_anomaly is not None
+    exposed_validation.blockers.append("caller mutation")
+    exposed_anomaly.symptoms.append("caller mutation")
+    assert "caller mutation" not in supervisor.last_validation_result.blockers
+    assert "caller mutation" not in supervisor.last_anomaly.symptoms
+
+
 def test_trace_summary_starts_empty_and_counts_successful_monitor_calls() -> None:
     first = _snapshot(sequence=0)
     second = _snapshot(sequence=1, status=ProgressStatus.RUNNING)

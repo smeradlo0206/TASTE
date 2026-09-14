@@ -245,16 +245,23 @@ def _parse_source_status(
         total += 1
         error = row.get("error")
         status = str(row.get("status") or "").strip().lower()
+        error_code = str(error or "").strip().lower()
+        is_limited = (
+            row.get("limited") is True
+            or row.get("rate_limited") is True
+            or status in {"limited", "rate_limited", "http_429"}
+            or error_code in {"rate_limited", "http_429"}
+        )
         is_failed = (
             (error is not None and bool(str(error).strip()))
             or row.get("failed") is True
             or row.get("ok") is False
             or status in {"failed", "failure", "error"}
         )
-        if is_failed:
-            failed += 1
-        elif row.get("limited") is True:
+        if is_limited:
             limited += 1
+        elif is_failed:
+            failed += 1
         elif row.get("ok") is True:
             ready += 1
     return total, ready, limited, failed

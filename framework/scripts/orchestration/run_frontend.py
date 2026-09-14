@@ -491,6 +491,7 @@ from feedback import (
     RunContext,
     SupervisorState,
     SupervisorStatus,
+    ValidationStatus,
     build_experience_query,
     build_find_stage_request,
 )
@@ -1437,6 +1438,12 @@ if recovery_execution_handle is not None:
 returncode = execution_handle.exit_code
 if returncode != 0:
     raise SystemExit(returncode)
+selected_validation = feedback_validator.validate(execution_handle)
+if (
+    selected_validation.status is not ValidationStatus.PASS
+    or selected_validation.ready_for_read is not True
+):
+    raise RuntimeError("Find result validation failed; failed run was not published")
 run_id, directory, result = _parse_find_cli_result(stdout_output, finding_module)
 if (
     execution_handle.run_id != run_id
@@ -1465,11 +1472,6 @@ def _copy_find_artifacts(target_dir):
             shutil.copyfile(source, target_dir / name)
             copied.append(name)
     return copied
-
-if publish_outputs:
-    adopt_taste_find_run(paths, {{"taste_run_id": run_id, "taste_run_dir": str(directory)}}, run_id)
-else:
-    _copy_find_artifacts(out_dir)
 
 def _safe_int(value, default=0):
     try:
@@ -1594,8 +1596,6 @@ def _write_frontend_state(stage, find_result, read_result=None, idea_result=None
     frontend_md_path.parent.mkdir(parents=True, exist_ok=True)
     frontend_md_path.write_text("".join(summary), encoding="utf-8")
     return payload
-
-_write_frontend_state("find_completed", result)
 
 def _taste_article_from_item(row, source):
     title = str(row.get("title") or "").strip()

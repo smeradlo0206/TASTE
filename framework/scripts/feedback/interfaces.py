@@ -133,9 +133,16 @@ class RecoveryController(Protocol):
     """Choose one recovery decision without executing it.
 
     The FeedbackSupervisor supplies the AnomalyBuilder output, immutable
-    RunContext, and current SupervisorState. Implementations return one
-    RecoveryDecision; they do not query stores, call upstream components,
-    modify inputs, control processes, execute recovery, or persist history.
+    RunContext, and current SupervisorState. An implementation may query an
+    injected RecoveryExperienceStore for verified recovery experience and may
+    call an injected RecoveryAdvisor when no reliable experience applies. It
+    must treat every advisor result as an untrusted RecoveryProposal and
+    validate it before returning a RecoveryDecision.
+
+    A controller does not execute recovery, does not persist history, does not
+    modify its inputs, and does not call Observer, ResultValidator, or
+    AnomalyBuilder. It also does not control processes, publish Find results,
+    or bypass an approval gate.
 
     Concrete implementations are responsible for checking run identity,
     allowed actions, remaining budget, and approval requirements. The returned
@@ -168,7 +175,12 @@ class RecoveryApprovalGate(Protocol):
 
 
 class RecoveryAdvisor(Protocol):
-    """Produce one untrusted recovery proposal without deciding or executing it."""
+    """Produce one untrusted RecoveryProposal for controller validation.
+
+    An advisor does not make the final recovery decision, does not execute
+    recovery, does not approve recovery, does not write an experience store,
+    and does not modify the Anomaly or other supplied contracts.
+    """
 
     def propose(
         self,
@@ -178,4 +190,26 @@ class RecoveryAdvisor(Protocol):
         supervisor_state: SupervisorState,
         matched_experiences: list[ExperienceCase],
     ) -> RecoveryProposal:
+        ...
+
+
+class ExperienceRecorder(Protocol):
+    """Convert one verified recovery outcome into an experience case.
+
+    A recorder organizes the supplied structured contracts and only produces
+    an ExperienceCase. It does not query or write an experience store, does not
+    call an LLM, does not read artifacts, does not execute recovery, does not
+    modify its inputs, and does not reconsider the selected recovery strategy.
+    """
+
+    def record(
+        self,
+        *,
+        run_context: RunContext,
+        anomaly: Anomaly,
+        recovery_decision: RecoveryDecision,
+        validation_before: ValidationResult,
+        recovery_execution_handle: ExecutionHandle,
+        validation_after: ValidationResult,
+    ) -> ExperienceCase:
         ...

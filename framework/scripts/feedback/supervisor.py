@@ -70,6 +70,16 @@ class FeedbackSupervisor:
         """Return a detached view of the active decision awaiting approval."""
         return deepcopy(self._pending_decision)
 
+    @property
+    def last_validation_result(self) -> ValidationResult | None:
+        """Return a detached view of the latest terminal validation evidence."""
+        return deepcopy(self._last_validation_result)
+
+    @property
+    def last_anomaly(self) -> Anomaly | None:
+        """Return a detached view of the latest classified anomaly evidence."""
+        return deepcopy(self._last_anomaly)
+
     trace_summary = property(
         lambda self: {
             "monitor_calls": self._monitor_call_count,

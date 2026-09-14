@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -13,6 +14,9 @@ from feedback.contracts import JsonContract
 from feedback import (
     Anomaly,
     ArtifactRef,
+    EvidenceCollectionRule,
+    EvidenceDefinition,
+    EvidenceFact,
     EvidenceRef,
     ExperienceCase,
     ExperienceQuery,
@@ -1830,7 +1834,7 @@ def test_experience_case_supports_normal_technical_and_preference_cases() -> Non
         case_id="case-technical-001",
         case_type="technical",
         root_cause_status="confirmed",
-        confirmed_root_cause="Source API timed out",
+        root_cause="Source API timed out",
         anomaly_id="anomaly-001",
         anomaly_kind="progress_stalled",
         anomaly_fingerprint="progress-stalled-title-screening",
@@ -1908,7 +1912,7 @@ def _skip_optional_source_experience_case(**overrides: object) -> ExperienceCase
         "case_id": "case-skip-source-001",
         "case_type": "technical",
         "root_cause_status": "confirmed",
-        "confirmed_root_cause": "Optional metadata source is unavailable",
+        "root_cause": "Optional metadata source is unavailable",
         "anomaly_id": "anomaly-skip-source-001",
         "anomaly_kind": "progress_stalled",
         "anomaly_fingerprint": "progress-stalled-optional-source",
@@ -2690,6 +2694,10 @@ def test_contract_module_defines_conversion_base_enums_and_internal_contracts() 
             "SupervisorEventType",
             "RiskLevel",
         "ArtifactRef",
+        "EvidenceCollectionRule",
+        "EvidenceDefinition",
+        "EvidenceFact",
+        "EvidenceMatchCondition",
         "EvidenceRef",
         "ExperienceRef",
         "ExperienceQuery",
@@ -2889,3 +2897,334 @@ def test_find_feedback_adapter_uses_conservative_recovery_defaults() -> None:
     assert context.requested_parameters == request.requested_parameters
     assert context.effective_parameters == request.requested_parameters
     assert request.to_dict() == request_before
+
+
+EVIDENCE_OBSERVED_AT = datetime(2026, 9, 10, 9, 0, tzinfo=timezone.utc)
+
+
+def _minimal_evidence_fact(**overrides: object) -> EvidenceFact:
+    values: dict[str, object] = {
+        "code": "find.candidate_count",
+        "value": 5,
+        "source_contract_id": "snapshot-001",
+        "source_field": "counts.candidates",
+        "producer": "find-progress-observer",
+        "run_id": "find-001",
+        "observed_at": EVIDENCE_OBSERVED_AT,
+    }
+    values.update(overrides)
+    return EvidenceFact(**values)  # type: ignore[arg-type]
+
+
+def _minimal_evidence_definition(**overrides: object) -> EvidenceDefinition:
+    values: dict[str, object] = {
+        "code": "find.candidate_count",
+        "value_type": "integer",
+        "intended_producer": "find-progress-observer",
+        "description": "Number of candidates actually observed by Find.",
+    }
+    values.update(overrides)
+    return EvidenceDefinition(**values)  # type: ignore[arg-type]
+
+
+def _minimal_evidence_collection_rule(
+    **overrides: object,
+) -> EvidenceCollectionRule:
+    values: dict[str, object] = {
+        "rule_id": "find-candidate-count-from-progress",
+        "evidence_code": "find.candidate_count",
+        "source_field": "counts.candidates",
+        "collector": "progress_snapshot_field",
+        "collector_parameters": {},
+        "implementation_status": "ready",
+    }
+    values.update(overrides)
+    return EvidenceCollectionRule(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        5,
+        5.5,
+        True,
+        "scoring",
+        [1, 2, 3],
+        {"phase": "scoring", "counts": [1, 2]},
+    ],
+)
+def test_evidence_fact_accepts_actual_json_values(value: object) -> None:
+    fact = _minimal_evidence_fact(value=value)
+
+    assert fact.value == value
+    assert fact.observed_at.tzinfo is not None
+    assert fact.schema_version == "feedback.evidence_fact.v1"
+
+
+def test_evidence_fact_accepts_explicit_current_schema_version() -> None:
+    fact = _minimal_evidence_fact(
+        schema_version="feedback.evidence_fact.v1",
+    )
+
+    assert fact.schema_version == "feedback.evidence_fact.v1"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["code", "source_contract_id", "source_field", "producer", "run_id"],
+)
+@pytest.mark.parametrize("value", ["", "   "])
+def test_evidence_fact_rejects_blank_identity_fields(
+    field_name: str,
+    value: str,
+) -> None:
+    with pytest.raises(ValueError, match=rf"EvidenceFact\.{field_name}"):
+        _minimal_evidence_fact(**{field_name: value})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        object(),
+        float("nan"),
+        float("inf"),
+        {"nested": [1, float("nan")]},
+        {"nested": {"number": float("-inf")}},
+    ],
+)
+def test_evidence_fact_rejects_missing_or_invalid_json_values(value: object) -> None:
+    with pytest.raises(ValueError, match=r"EvidenceFact\.value"):
+        _minimal_evidence_fact(value=value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["Bearer credential", {"token": "credential"}],
+)
+def test_evidence_fact_rejects_obvious_secrets(value: object) -> None:
+    with pytest.raises(ValueError, match=r"EvidenceFact\.value"):
+        _minimal_evidence_fact(value=value)
+
+
+@pytest.mark.parametrize(
+    "observed_at",
+    [datetime(2026, 9, 10, 9, 0), "2026-09-10T09:00:00Z"],
+)
+def test_evidence_fact_rejects_invalid_observed_at(observed_at: object) -> None:
+    with pytest.raises(ValueError, match=r"EvidenceFact\.observed_at"):
+        _minimal_evidence_fact(observed_at=observed_at)
+
+
+def test_evidence_fact_rejects_wrong_schema() -> None:
+    with pytest.raises(ValueError, match=r"EvidenceFact\.schema_version"):
+        _minimal_evidence_fact(schema_version="feedback.evidence_fact.v2")
+
+
+@pytest.mark.parametrize(
+    "value_type",
+    ["boolean", "integer", "number", "string", "array", "object"],
+)
+def test_evidence_definition_accepts_closed_value_types(value_type: str) -> None:
+    definition = _minimal_evidence_definition(value_type=value_type)
+
+    assert definition.value_type == value_type
+    assert definition.schema_version == "feedback.evidence_definition.v1"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("code", " "),
+        ("value_type", ""),
+        ("value_type", "unknown"),
+        ("value_type", "null"),
+        ("intended_producer", " "),
+        ("description", ""),
+    ],
+)
+def test_evidence_definition_rejects_invalid_required_fields(
+    field_name: str,
+    value: str,
+) -> None:
+    with pytest.raises(ValueError, match=rf"EvidenceDefinition\.{field_name}"):
+        _minimal_evidence_definition(**{field_name: value})
+
+
+def test_evidence_definition_rejects_secrets_and_wrong_schema() -> None:
+    with pytest.raises(ValueError, match=r"EvidenceDefinition\.description"):
+        _minimal_evidence_definition(description="Use Bearer credential")
+    with pytest.raises(ValueError, match=r"EvidenceDefinition\.schema_version"):
+        _minimal_evidence_definition(
+            schema_version="feedback.evidence_definition.v2",
+        )
+
+
+@pytest.mark.parametrize(
+    "implementation_status",
+    ["ready", "needs_instrumentation", "unsupported"],
+)
+@pytest.mark.parametrize(
+    "collector_parameters",
+    [{}, {"path": ["scoring", "queue_depth"], "options": {"strict": True}}],
+)
+def test_evidence_collection_rule_accepts_inert_supported_shapes(
+    implementation_status: str,
+    collector_parameters: dict[str, object],
+) -> None:
+    rule = _minimal_evidence_collection_rule(
+        implementation_status=implementation_status,
+        collector_parameters=collector_parameters,
+    )
+
+    assert rule.implementation_status == implementation_status
+    assert rule.collector_parameters == collector_parameters
+    assert rule.schema_version == "feedback.evidence_collection_rule.v1"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["rule_id", "evidence_code", "source_field", "collector"],
+)
+def test_evidence_collection_rule_rejects_blank_identity_fields(
+    field_name: str,
+) -> None:
+    with pytest.raises(ValueError, match=rf"EvidenceCollectionRule\.{field_name}"):
+        _minimal_evidence_collection_rule(**{field_name: " "})
+
+
+@pytest.mark.parametrize(
+    "collector_parameters",
+    [
+        [],
+        {"unsupported": object()},
+        {"number": float("nan")},
+        {"number": float("inf")},
+        {"nested": [1, float("-inf")]},
+        {"authorization": "credential"},
+    ],
+)
+def test_evidence_collection_rule_rejects_unsafe_parameters(
+    collector_parameters: object,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"EvidenceCollectionRule\.collector_parameters",
+    ):
+        _minimal_evidence_collection_rule(
+            collector_parameters=collector_parameters,
+        )
+
+
+@pytest.mark.parametrize(
+    "implementation_status",
+    ["", "proposed", "active", "confirmed"],
+)
+def test_evidence_collection_rule_rejects_other_status_domains(
+    implementation_status: str,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"EvidenceCollectionRule\.implementation_status",
+    ):
+        _minimal_evidence_collection_rule(
+            implementation_status=implementation_status,
+        )
+
+
+def test_evidence_collection_rule_rejects_wrong_schema() -> None:
+    with pytest.raises(ValueError, match=r"EvidenceCollectionRule\.schema_version"):
+        _minimal_evidence_collection_rule(
+            schema_version="feedback.evidence_collection_rule.v2",
+        )
+
+
+def test_evidence_contract_field_sets_exclude_duplicate_semantics() -> None:
+    assert {item.name for item in fields(EvidenceFact)} == {
+        "code",
+        "value",
+        "source_contract_id",
+        "source_field",
+        "producer",
+        "run_id",
+        "observed_at",
+        "schema_version",
+    }
+    assert {item.name for item in fields(EvidenceDefinition)} == {
+        "code",
+        "value_type",
+        "intended_producer",
+        "description",
+        "schema_version",
+    }
+    assert {item.name for item in fields(EvidenceCollectionRule)} == {
+        "rule_id",
+        "evidence_code",
+        "source_field",
+        "collector",
+        "collector_parameters",
+        "implementation_status",
+        "schema_version",
+    }
+
+
+def test_observed_anomaly_kind_is_not_a_root_cause_code() -> None:
+    doc = " ".join((inspect.getdoc(Anomaly) or "").casefold().split())
+
+    assert "observed anomaly classification" in doc
+    assert "not a root-cause code" in doc
+
+
+def test_evidence_reference_kind_is_distinct_from_observed_fact_code() -> None:
+    doc = " ".join((inspect.getdoc(EvidenceRef) or "").casefold().split())
+    reference_fields = {item.name for item in fields(EvidenceRef)}
+    fact_fields = {item.name for item in fields(EvidenceFact)}
+
+    assert "classifies the reference" in doc
+    assert "not a machine-readable observed fact code" in doc
+    assert not {"code", "value"} & reference_fields
+    assert {"code", "value"} <= fact_fields
+    assert "kind" not in fact_fields
+
+
+def test_validation_check_code_is_distinct_from_observed_fact_code() -> None:
+    check_doc = " ".join((inspect.getdoc(ValidationCheck) or "").casefold().split())
+    fact_doc = " ".join((inspect.getdoc(EvidenceFact) or "").casefold().split())
+    check = ValidationCheck(
+        code="result_exists",
+        status=ValidationStatus.PASS,
+        required=True,
+        message="Result exists",
+        expected=True,
+        actual=True,
+    )
+    fact = _minimal_evidence_fact(code="find.result_exists", value=True)
+
+    assert "identifies one validation check" in check_doc
+    assert "identifies one reusable observed fact" in fact_doc
+    assert type(check) is not type(fact)
+    assert {"expected", "actual"} <= {item.name for item in fields(check)}
+    assert "value" in {item.name for item in fields(fact)}
+    with pytest.raises(ValueError):
+        EvidenceFact.from_dict(check.to_dict())
+    with pytest.raises(ValueError):
+        ValidationCheck.from_dict(fact.to_dict())
+
+
+def test_evidence_fact_code_describes_observation_not_root_cause() -> None:
+    doc = " ".join((inspect.getdoc(EvidenceFact) or "").casefold().split())
+    fact_fields = {item.name for item in fields(EvidenceFact)}
+
+    assert "what was observed" in doc
+    assert "not why the anomaly occurred" in doc
+    assert not {
+        "root_cause_code",
+        "root_cause_status",
+        "confidence",
+        "hypotheses",
+    } & fact_fields
+
+
+@pytest.mark.parametrize("code", ["progress_stalled", "validation", "result_exists"])
+def test_evidence_fact_semantic_boundary_is_not_a_string_blacklist(code: str) -> None:
+    assert _minimal_evidence_fact(code=code).code == code

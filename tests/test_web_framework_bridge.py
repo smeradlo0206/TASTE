@@ -1960,6 +1960,18 @@ def _feedback_trace_payloads(stdout: str) -> list[dict[str, object]]:
     ]
 
 
+def _frontend_success_payloads(stdout: str) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    for line in stdout.splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("stage") == "find_completed":
+            payloads.append(payload)
+    return payloads
+
+
 def test_generated_driver_wires_supervisor_between_context_and_executor(tmp_path):
     from orchestration import run_frontend
 
@@ -2513,8 +2525,11 @@ def capture_completed_handles():
     assert Path(exited_events[0]["handle"]["run_dir"]) == run_dir
     assert exited_events[0]["handle"]["process_alive"] is False
     assert exited_events[0]["handle"]["exit_code"] == 0
-    assert len(validator_events) == 1
-    assert validator_events[0]["validation"]["status"] == "pass"
+    assert len(validator_events) == 2
+    assert [event["validation"]["status"] for event in validator_events] == [
+        "pass",
+        "pass",
+    ]
     assert anomaly_events[-1]["anomaly"] is None
     assert controller_events == []
     expected_advisor_events = (
@@ -2627,6 +2642,45 @@ def _run_generated_driver_recovery_case(
         ),
         encoding="utf-8",
     )
+    prior_find_dir = project_root / "planning" / "finding"
+    prior_find_dir.mkdir(parents=True)
+    prior_find_results_path = prior_find_dir / "find_results.json"
+    prior_find_results_path.write_text(
+        json.dumps(
+            {
+                "run_id": "find-prior-success",
+                "strong_recommendations": [
+                    {"id": "paper-prior", "title": "Prior successful result"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    frontend_state_path = project_root / "state" / "finding_frontend.json"
+    frontend_state_path.parent.mkdir(parents=True)
+    frontend_state_path.write_text(
+        json.dumps(
+            {
+                "stage": "find_completed",
+                "status": "find_completed",
+                "taste_run_id": "find-prior-success",
+            }
+        ),
+        encoding="utf-8",
+    )
+    frontend_summary_path = project_root / "planning" / "finding_frontend.md"
+    frontend_summary_path.write_text(
+        "# Prior successful Find\n\n- taste_run_id: find-prior-success\n",
+        encoding="utf-8",
+    )
+    public_find_before = {
+        path: path.read_bytes()
+        for path in (
+            prior_find_results_path,
+            frontend_state_path,
+            frontend_summary_path,
+        )
+    }
     project_before = project_path.read_bytes()
     finding_config_before = finding_config_path.read_bytes()
 
@@ -2674,8 +2728,9 @@ print(
     encoding="utf-8",
 )
 time.sleep(1.1)
+initial_succeeds = attempt == 1 and {mode!r} == "initial_success"
 recovery_succeeds = attempt == 2 and {mode!r} != "automatic_failure"
-recommendations = [{{"id": "paper-recovered", "title": "Recovered result"}}] if recovery_succeeds else []
+recommendations = [{{"id": "paper-recovered", "title": "Recovered result"}}] if initial_succeeds or recovery_succeeds else []
 config = json.loads(Path(args.config_json).read_text(encoding="utf-8"))
 result = {{
     "run_id": run_id,
@@ -2755,6 +2810,10 @@ JsonExperienceStore.search_recovery_cases = capture_recovery_search
 def fake_propose(self, *, anomaly, run_context, supervisor_state, matched_experiences):
     mode = os.environ["RECOVERY_CASE_MODE"]
     risk = RiskLevel.MEDIUM if mode == "pending" else RiskLevel.LOW
+    action = {
+        "no_action": RecoveryAction.NO_ACTION,
+        "stop_and_report": RecoveryAction.STOP_AND_REPORT,
+    }.get(mode, RecoveryAction.RETRY_NEW_RUN)
     record("advisor", anomaly_id=anomaly.anomaly_id, matched=len(matched_experiences))
     return RecoveryProposal(
         proposal_id="proposal-offline-recovery",
@@ -2762,7 +2821,7 @@ def fake_propose(self, *, anomaly, run_context, supervisor_state, matched_experi
         run_id=anomaly.run_id,
         anomaly_id=anomaly.anomaly_id,
         created_at=datetime.now(timezone.utc),
-        proposed_action=RecoveryAction.RETRY_NEW_RUN,
+        proposed_action=action,
         reason="Synthetic test-only bounded recovery",
         confidence=1.0,
         risk_level=risk,
@@ -2946,6 +3005,9 @@ def capture_completed_handles():
         input_dir=tmp_path / "driver-input",
         web_job_id=web_job_id,
         fake_find_count=int(counter_path.read_text(encoding="utf-8")),
+        public_find_before=public_find_before,
+        public_find_names_before=sorted(path.name for path in prior_find_dir.iterdir()),
+        prior_find_dir=prior_find_dir,
     )
 
 
@@ -2974,7 +3036,7 @@ def test_generated_driver_approves_pending_decision_and_publishes_recovery_run(
     assert len([event for event in events if event["event"] == "advisor"]) == 1
     assert len([event for event in events if event["event"] == "gate"]) == 1
     assert len([event for event in events if event["event"] == "supervisor_resolve"]) == 1
-    assert [event["status"] for event in validators] == ["block", "pass"]
+    assert [event["status"] for event in validators] == ["block", "pass", "pass"]
     assert [event["run_id"] for event in exits] == [
         "find-recovery-initial",
         "find-recovery-success",
@@ -2988,8 +3050,8 @@ def test_generated_driver_approves_pending_decision_and_publishes_recovery_run(
     )
     assert [event["run_id"] for event in events if event["event"] == "publish"] == [
         "find-recovery-success",
-        "find-recovery-success",
     ]
+    assert len([event for event in events if event["event"] == "read_default"]) == 1
     assert len(completed_handles) == 2
     assert all(handle["process_alive"] is False for handle in completed_handles)
     assert all(handle["exit_code"] == 0 for handle in completed_handles)
@@ -3041,6 +3103,12 @@ def test_generated_driver_rejects_pending_decision_without_recovery_find(
         "rejected"
     ]
     assert not (result.input_dir / "recovery").exists()
+    assert [event for event in result.events if event["event"] == "publish"] == []
+    assert [event for event in result.events if event["event"] == "read_default"] == []
+    assert _frontend_success_payloads(result.stdout) == []
+    assert "Find result validation failed" in result.stderr
+    assert sorted(path.name for path in result.prior_find_dir.iterdir()) == result.public_find_names_before
+    assert all(path.read_bytes() == content for path, content in result.public_find_before.items())
     assert not (
         result.project_root / "tmp" / "feedback_recovery" / result.web_job_id
     ).exists()
@@ -3051,10 +3119,78 @@ def test_generated_driver_rejects_pending_decision_without_recovery_find(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="the recovery driver is verified in WSL/POSIX")
+def test_generated_driver_blocks_failed_initial_run_without_executable_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    mode = "stop_and_report"
+    result = _run_generated_driver_recovery_case(
+        tmp_path,
+        monkeypatch,
+        mode=mode,
+        approval=None,
+    )
+
+    decisions = [
+        event["decision"]
+        for event in result.events
+        if event["event"] == "supervisor_exited"
+    ]
+    assert result.returncode != 0
+    assert result.fake_find_count == 1
+    assert len([event for event in result.events if event["event"] == "find_popen"]) == 1
+    assert decisions[0]["action"] == mode
+    assert [event for event in result.events if event["event"] == "gate"] == []
+    assert [event for event in result.events if event["event"] == "publish"] == []
+    assert [event for event in result.events if event["event"] == "read_default"] == []
+    assert _frontend_success_payloads(result.stdout) == []
+    assert "Find result validation failed" in result.stderr
+    assert not (result.input_dir / "recovery").exists()
+    assert not (
+        result.project_root / "tmp" / "feedback_recovery" / result.web_job_id
+    ).exists()
+    assert sorted(path.name for path in result.prior_find_dir.iterdir()) == result.public_find_names_before
+    assert all(path.read_bytes() == content for path, content in result.public_find_before.items())
+    assert result.project_path.read_bytes() == result.project_before
+    assert result.finding_config_path.read_bytes() == result.finding_config_before
+    assert result.module_config_path.read_bytes() == result.module_config_before
+    assert not result.store_path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the recovery driver is verified in WSL/POSIX")
+def test_generated_driver_publishes_initial_validator_pass_once(tmp_path, monkeypatch):
+    result = _run_generated_driver_recovery_case(
+        tmp_path,
+        monkeypatch,
+        mode="initial_success",
+        approval=None,
+    )
+
+    assert result.returncode == 0
+    assert result.fake_find_count == 1
+    assert len([event for event in result.events if event["event"] == "find_popen"]) == 1
+    assert [event["status"] for event in result.events if event["event"] == "validator"] == [
+        "pass",
+        "pass",
+    ]
+    assert [event for event in result.events if event["event"] == "advisor"] == []
+    assert [event["run_id"] for event in result.events if event["event"] == "publish"] == [
+        "find-recovery-initial"
+    ]
+    assert len([event for event in result.events if event["event"] == "read_default"]) == 1
+    success_payloads = _frontend_success_payloads(result.stdout)
+    assert len(success_payloads) == 1
+    assert success_payloads[0]["taste_run_id"] == "find-recovery-initial"
+    assert not (
+        result.project_root / "tmp" / "feedback_recovery" / result.web_job_id
+    ).exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the recovery driver is verified in WSL/POSIX")
 @pytest.mark.parametrize(
     ("mode", "expected_returncode", "expected_publish_count"),
     [
-        pytest.param("automatic_success", 0, 2, id="not-required-success"),
+        pytest.param("automatic_success", 0, 1, id="not-required-success"),
         pytest.param("automatic_failure", 1, 0, id="recovery-blocked"),
     ],
 )

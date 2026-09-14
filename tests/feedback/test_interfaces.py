@@ -16,6 +16,7 @@ from feedback import (
     ExecutionHandle,
     Executor,
     ExperienceCase,
+    ExperienceRecorder,
     ExperienceQuery,
     ExperienceStore,
     FeedbackAdapter,
@@ -41,6 +42,10 @@ from feedback import (
 
 
 OBSERVED_AT = datetime(2026, 9, 1, 14, 0, tzinfo=timezone.utc)
+
+
+def _normalized_doc(component: object) -> str:
+    return " ".join((inspect.getdoc(component) or "").casefold().split())
 
 
 def _make_run_context() -> RunContext:
@@ -376,6 +381,43 @@ class FakeRecoveryAdvisor:
         )
 
 
+class FakeExperienceRecorder:
+    def __init__(self, result: ExperienceCase) -> None:
+        self.result = result
+        self.calls: list[
+            tuple[
+                RunContext,
+                Anomaly,
+                RecoveryDecision,
+                ValidationResult,
+                ExecutionHandle,
+                ValidationResult,
+            ]
+        ] = []
+
+    def record(
+        self,
+        *,
+        run_context: RunContext,
+        anomaly: Anomaly,
+        recovery_decision: RecoveryDecision,
+        validation_before: ValidationResult,
+        recovery_execution_handle: ExecutionHandle,
+        validation_after: ValidationResult,
+    ) -> ExperienceCase:
+        self.calls.append(
+            (
+                run_context,
+                anomaly,
+                recovery_decision,
+                validation_before,
+                recovery_execution_handle,
+                validation_after,
+            )
+        )
+        return self.result
+
+
 def _observe_once(
     observer: interfaces.Observer,
     run_context: RunContext,
@@ -459,6 +501,135 @@ def _propose_recovery(
         supervisor_state=supervisor_state,
         matched_experiences=matched_experiences,
     )
+
+
+def test_experience_recorder_has_the_minimal_record_signature() -> None:
+    recorder = interfaces.ExperienceRecorder
+    hints = get_type_hints(recorder.record)
+    signature = inspect.signature(recorder.record)
+    public_members = {
+        name for name in recorder.__dict__ if not name.startswith("_")
+    }
+
+    assert Protocol in recorder.__mro__
+    assert getattr(recorder, "_is_runtime_protocol", False) is False
+    assert list(signature.parameters) == [
+        "self",
+        "run_context",
+        "anomaly",
+        "recovery_decision",
+        "validation_before",
+        "recovery_execution_handle",
+        "validation_after",
+    ]
+    assert hints["run_context"] is RunContext
+    assert hints["anomaly"] is Anomaly
+    assert hints["recovery_decision"] is RecoveryDecision
+    assert hints["validation_before"] is ValidationResult
+    assert hints["recovery_execution_handle"] is ExecutionHandle
+    assert hints["validation_after"] is ValidationResult
+    assert hints["return"] is ExperienceCase
+    for name in list(signature.parameters)[1:]:
+        parameter = signature.parameters[name]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
+    assert public_members == {"record"}
+
+
+def test_fake_experience_recorder_connects_existing_contracts() -> None:
+    run_context = _make_run_context()
+    anomaly = _make_anomaly()
+    supervisor_state = _make_supervisor_state(run_context, anomaly)
+    recovery_decision = FakeRecoveryController().decide(
+        anomaly=anomaly,
+        run_context=run_context,
+        supervisor_state=supervisor_state,
+    )
+    validation_before = _make_validation_result()
+    recovery_execution_handle = ExecutionHandle(
+        context_id=run_context.context_id,
+        pid=6103,
+        started_at=OBSERVED_AT,
+        process_alive=False,
+        stdout_path="/runtime/logs/recovery.stdout.log",
+        stderr_path="/runtime/logs/recovery.stderr.log",
+        run_id="find-recovery-interface",
+        run_dir="/runtime/runs/find-recovery-interface",
+        exit_code=0,
+    )
+    validation_after = ValidationResult.from_dict(
+        {
+            **validation_before.to_dict(),
+            "validation_id": "validation-after-interface",
+            "run_id": recovery_execution_handle.run_id,
+            "validated_run_dir": recovery_execution_handle.run_dir,
+        }
+    )
+    expected = ExperienceCase(
+        case_id="case-recorder-interface",
+        case_type="technical",
+        created_at=OBSERVED_AT,
+        updated_at=OBSERVED_AT,
+        producer="interface-tests",
+        producer_version="1.0",
+        verified=True,
+        deprecated=False,
+        context_id=run_context.context_id,
+        root_run_id=anomaly.run_id,
+        final_run_id=recovery_execution_handle.run_id,
+        root_cause_status="unknown",
+        evidence_refs=list(anomaly.evidence_refs),
+        attempt_count=recovery_decision.attempt_index,
+        outcome="recovered",
+        validation_after_id=validation_after.validation_id,
+        validation_after_status=ValidationStatus.PASS,
+        ready_for_read_after=True,
+        risk_level=recovery_decision.risk_level,
+        confidence=anomaly.confidence,
+        matched_count=1,
+        applied_count=1,
+        successful_application_count=1,
+        project_id=run_context.project_id,
+        anomaly_id=anomaly.anomaly_id,
+        anomaly_kind=anomaly.kind,
+        anomaly_fingerprint=anomaly.fingerprint,
+        decision_id=recovery_decision.decision_id,
+        recovery_action=recovery_decision.action,
+        validation_before_id=validation_before.validation_id,
+        validation_before_status=validation_before.status,
+    )
+    recorder: ExperienceRecorder = FakeExperienceRecorder(expected)
+
+    result = recorder.record(
+        run_context=run_context,
+        anomaly=anomaly,
+        recovery_decision=recovery_decision,
+        validation_before=validation_before,
+        recovery_execution_handle=recovery_execution_handle,
+        validation_after=validation_after,
+    )
+
+    assert result is expected
+    assert recorder.calls == [
+        (
+            run_context,
+            anomaly,
+            recovery_decision,
+            validation_before,
+            recovery_execution_handle,
+            validation_after,
+        )
+    ]
+
+
+def test_experience_recorder_has_stable_module_and_public_imports() -> None:
+    from feedback import ExperienceRecorder as PublicExperienceRecorder
+    from feedback.interfaces import ExperienceRecorder as ModuleExperienceRecorder
+
+    assert PublicExperienceRecorder is interfaces.ExperienceRecorder
+    assert ModuleExperienceRecorder is interfaces.ExperienceRecorder
+    assert ExperienceRecorder is interfaces.ExperienceRecorder
+    assert "ExperienceRecorder" in feedback.__all__
 
 
 def test_recovery_advisor_has_the_minimal_propose_signature() -> None:
@@ -682,6 +853,68 @@ def test_recovery_controller_has_stable_module_and_public_imports() -> None:
     assert ModuleRecoveryController is interfaces.RecoveryController
     assert RecoveryController is interfaces.RecoveryController
     assert "RecoveryController" in feedback.__all__
+
+
+def test_recovery_controller_is_the_only_public_root_cause_matching_protocol() -> None:
+    assert interfaces.RecoveryController is RecoveryController
+    for forbidden_name in (
+        "RootCauseMatcher",
+        "Curator",
+        "ExperienceCurator",
+        "RootCauseCurator",
+    ):
+        assert not hasattr(interfaces, forbidden_name)
+
+
+def test_recovery_controller_documents_store_and_advisor_coordination() -> None:
+    doc = _normalized_doc(interfaces.RecoveryController)
+
+    assert "query an injected recoveryexperiencestore" in doc
+    assert "call an injected recoveryadvisor" in doc
+    assert "untrusted recoveryproposal" in doc
+
+
+def test_recovery_controller_documents_forbidden_side_effects() -> None:
+    doc = _normalized_doc(interfaces.RecoveryController)
+
+    for responsibility in (
+        "does not execute recovery",
+        "does not persist history",
+        "does not modify its inputs",
+        "does not call observer, resultvalidator, or anomalybuilder",
+    ):
+        assert responsibility in doc
+
+
+def test_evidence_component_docstrings_preserve_fact_and_proposal_boundaries() -> None:
+    anomaly_builder_doc = _normalized_doc(interfaces.AnomalyBuilder)
+    advisor_doc = _normalized_doc(interfaces.RecoveryAdvisor)
+    recorder_doc = _normalized_doc(interfaces.ExperienceRecorder)
+
+    for responsibility in (
+        "only organizes supplied evidence",
+        "does not read files",
+        "modify its inputs",
+        "recover runs",
+    ):
+        assert responsibility in anomaly_builder_doc
+
+    for responsibility in (
+        "untrusted recoveryproposal",
+        "does not make the final recovery decision",
+        "does not execute recovery",
+        "does not write an experience store",
+        "does not modify the anomaly",
+    ):
+        assert responsibility in advisor_doc
+
+    for responsibility in (
+        "only produces an experiencecase",
+        "does not query or write an experience store",
+        "does not execute recovery",
+        "does not modify its inputs",
+    ):
+        assert responsibility in recorder_doc
 
 
 def test_recovery_approval_gate_has_the_minimal_resolve_signature() -> None:
