@@ -84,9 +84,10 @@ that run.
 
 `EvidenceFact`, `EvidenceDefinition`, and `EvidenceCollectionRule` are implemented
 as foundational data contracts. `ProgressSnapshot`, `ValidationResult`, and
-`Anomaly` can carry `EvidenceFact`, but production components are not connected:
-Observer and Validator do not yet produce Facts, AnomalyBuilder does not yet
-propagate them, and Advisor does not yet produce definitions or rules.
+`Anomaly` can carry `EvidenceFact`. `FileProgressObserver` produces the first
+bounded Facts for `find.seconds_without_progress`, `find.source_total`, and
+`find.source_limited`. Validator does not yet produce Facts, AnomalyBuilder does
+not yet propagate them, and Advisor does not yet produce definitions or rules.
 
 ## 5. Source outcome classification
 
@@ -130,7 +131,8 @@ versions are rejected. The migration logic is local to `ProgressSnapshot`,
 serialization behavior of unrelated contracts.
 
 The v2 carrier contracts and their local v1-to-v2 migrations are implemented.
-Production Fact creation and propagation remain unimplemented.
+Observer production is connected only for the three bounded Facts listed above;
+Validator production and AnomalyBuilder propagation remain unimplemented.
 
 ## 7. ExperienceCase v2 root-cause semantics
 
@@ -364,6 +366,9 @@ This section is normative target behavior. Stage 0 does not implement Writer,
 - `ProgressSnapshot`, `ValidationResult`, and `Anomaly` v2 can carry validated,
   detached `EvidenceFact` values and locally migrate valid v1 payloads to empty
   Fact lists.
+- `FileProgressObserver` produces `find.seconds_without_progress` for a bound
+  run, plus `find.source_total` and `find.source_limited` only when the current
+  progress payload contains a valid source-status list.
 - Observer, Validator, AnomalyBuilder, Controller, Advisor, approval Gate, and
   Supervisor behavior for the currently supported fields and recovery flow.
 - Read-only `ExperienceStore` and `RecoveryExperienceStore` query interfaces.
@@ -384,8 +389,8 @@ This section is normative target behavior. Stage 0 does not implement Writer,
 
 ### Not implemented
 
-- Observer and Validator production of `EvidenceFact` and AnomalyBuilder
-  propagation of upstream Facts.
+- Validator production of `EvidenceFact` and AnomalyBuilder propagation of
+  upstream Facts.
 - `EvidenceMatchCondition` and `ExperienceCase` v2.
 - Advisor extensions for new root-cause hypotheses, evidence definitions, or
   evidence collection rules.
@@ -399,8 +404,8 @@ This section is normative target behavior. Stage 0 does not implement Writer,
 - No `RootCauseMatcher` or synonymous matching component.
 - No `Curator`, `ExperienceCurator`, `RootCauseCurator`, or synonym.
 - No new or changed production data contract.
-- No production wiring for `EvidenceFact`, `EvidenceDefinition`, or
-  `EvidenceCollectionRule`.
+- No production wiring for `EvidenceDefinition` or `EvidenceCollectionRule`, and
+  no `EvidenceFact` wiring beyond the bounded Observer production stated above.
 - No temporary-rule registration or injection behavior.
 - No concrete Recorder implementation.
 - No Writer or Store write method.

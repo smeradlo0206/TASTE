@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from .contracts import (
     ArtifactRef,
+    EvidenceFact,
     ExecutionHandle,
     ProgressSnapshot,
     ProgressStatus,
@@ -431,6 +432,7 @@ class FileProgressObserver:
         run_started_at: datetime | None = None
         progress_updated_at: datetime | None = None
         source_total = source_ready = source_limited = source_failed = 0
+        source_status_observed = False
         progress_parse_ok = False
         result_exists = False
         result_size_bytes: int | None = None
@@ -568,8 +570,14 @@ class FileProgressObserver:
                         field_name="run_started_at",
                         observation_errors=observation_errors,
                     )
+                    source_status = payload.get("source_status")
+                    source_status_observed = (
+                        "source_status" in payload
+                        and isinstance(source_status, list)
+                        and all(isinstance(row, dict) for row in source_status)
+                    )
                     source_total, source_ready, source_limited, source_failed = _parse_source_status(
-                        payload.get("source_status"),
+                        source_status,
                         observation_errors=observation_errors,
                     )
 
@@ -632,8 +640,45 @@ class FileProgressObserver:
             seconds_without_progress=seconds_without_progress,
             result_exists=result_exists,
         )
+        snapshot_id = f"snapshot-{uuid4().hex}"
+        evidence_facts: list[EvidenceFact] = []
+        if run_id:
+            evidence_facts.append(
+                EvidenceFact(
+                    code="find.seconds_without_progress",
+                    value=seconds_without_progress,
+                    source_contract_id=snapshot_id,
+                    source_field="seconds_without_progress",
+                    producer=_PRODUCER,
+                    run_id=run_id,
+                    observed_at=observed_at,
+                )
+            )
+            if source_status_observed:
+                evidence_facts.extend(
+                    [
+                        EvidenceFact(
+                            code="find.source_total",
+                            value=source_total,
+                            source_contract_id=snapshot_id,
+                            source_field="source_total",
+                            producer=_PRODUCER,
+                            run_id=run_id,
+                            observed_at=observed_at,
+                        ),
+                        EvidenceFact(
+                            code="find.source_limited",
+                            value=source_limited,
+                            source_contract_id=snapshot_id,
+                            source_field="source_limited",
+                            producer=_PRODUCER,
+                            run_id=run_id,
+                            observed_at=observed_at,
+                        ),
+                    ]
+                )
         return ProgressSnapshot(
-            snapshot_id=f"snapshot-{uuid4().hex}",
+            snapshot_id=snapshot_id,
             run_id=run_id,
             created_at=observed_at,
             observed_at=observed_at,
@@ -680,4 +725,5 @@ class FileProgressObserver:
             source_signals=sorted(source_signals),
             observation_errors=observation_errors,
             evidence_refs=[],
+            evidence_facts=evidence_facts,
         )
